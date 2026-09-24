@@ -1,0 +1,351 @@
+"""
+Unlimited Text-to-Speech (Streamlit + edge-tts)
+
+Install & run:
+    pip install streamlit edge-tts
+    streamlit run tts_app.py
+
+Features
+  * Any language / gender / voice that edge-tts offers, speed / pitch / volume
+  * Single text tab: paste any amount of text (it is split into safe chunks automatically)
+  * Batch tab: upload many .txt / .md files or a whole .zip (e.g. the `podcast/` folder),
+    or point to a local folder. One MP3 per chapter or one MP3 per file. Everything is
+    saved to a local folder and offered as one ZIP. Runs can be resumed (finished files are skipped).
+  * The app itself has no character, file-count or duration limit.
+    (Only the online Microsoft service behind edge-tts can throttle you; the app retries automatically.)
+"""
+import asyncio
+import io
+import re
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import edge_tts
+import streamlit as st
+
+MAX_CHARS = 2500  # size of one request to the service; longer text is split automatically
+
+FALLBACK_VOICES = [
+    ("en-US-AriaNeural", "Female", "en-US", "English", "United States"),
+    ("en-US-GuyNeural", "Male", "en-US", "English", "United States"),
+    ("en-US-JennyNeural", "Female", "en-US", "English", "United States"),
+    ("en-GB-SoniaNeural", "Female", "en-GB", "English", "United Kingdom"),
+    ("en-GB-RyanNeural", "Male", "en-GB", "English", "United Kingdom"),
+    ("fa-IR-DilaraNeural", "Female", "fa-IR", "Persian", "Iran"),
+    ("fa-IR-FaridNeural", "Male", "fa-IR", "Persian", "Iran"),
+]
+
+
+# --------------------------------------------------------------------------- voices
+@st.cache_data(ttl=86400, show_spinner="Loading voices…")
+def load_voices():
+    rows = []
+    try:
+        for v in asyncio.run(edge_tts.list_voices()):
+            m = re.search(r"-\s*([^()]+?)\s*\((.+)\)\s*$", v.get("FriendlyName", ""))
+            lang, region = (m.group(1), m.group(2)) if m else (v["Locale"], "")
+            rows.append(dict(short=v["ShortName"], gender=v["Gender"], locale=v["Locale"], lang=lang, region=region))
+    except Exception:
+        rows = [dict(short=s, gender=g, locale=l, lang=la, region=r) for s, g, l, la, r in FALLBACK_VOICES]
+        rows[0]["offline"] = True
+    for r in rows:
+        r["name"] = r["short"].split("-")[-1].replace("Neural", "")
+        r["label"] = " - ".join(x for x in (r["lang"], r["region"], r["name"]) if x)
+    return sorted(rows, key=lambda r: (r["lang"], r["region"], r["name"]))
+
+
+# --------------------------------------------------------------------------- synthesis
+def split_text(text, limit=MAX_CHARS):
+    """Split long text on paragraph / sentence boundaries into chunks <= limit characters."""
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    pieces = []
+    for para in re.split(r"\n\s*\n", text):
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) <= limit:
+            pieces.append(para)
+        else:
+            pieces.extend(s for s in re.split(r"(?<=[.!?…؟。])\s+", para) if s.strip())
+    chunks, cur = [], ""
+    for p in pieces:
+        while len(p) > limit:  # a single monstrous sentence
+            cut = p.rfind(" ", 0, limit)
+            cut = cut if cut > 0 else limit
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(p[:cut]); p = p[cut:].strip()
+        if len(cur) + len(p) + 2 <= limit:
+            cur = f"{cur}\n\n{p}" if cur else p
+        else:
+            chunks.append(cur); cur = p
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if c.strip()]
+
+
+async def synth(text, cfg, retries=5):
+    out = bytearray()
+    for chunk in split_text(text):
+        for attempt in range(retries):
+            try:
+                comm = edge_tts.Communicate(chunk, cfg["voice"], rate=cfg["rate"], pitch=cfg["pitch"], volume=cfg["volume"])
+                data = bytearray()
+                async for msg in comm.stream():
+                    if msg["type"] == "audio":
+                        data += msg["data"]
+                if not data:
+                    raise RuntimeError("no audio received")
+                out += data
+                break
+            except Exception:
+                if attempt == retries - 1:
+                    raise
+                await asyncio.sleep(1.5 * (attempt + 1))
+    return bytes(out)
+
+
+# --------------------------------------------------------------------------- parsing sources
+def slug(s, n=60):
+    return re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")[:n] or "section"
+
+
+def sections_from_txt(text):
+    """[(title, [lines])] — splits at lines like 'Chapter 1.2 — …' / 'Topic 3 — …'."""
+    secs, title, lines, seen = [], None, [], False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if re.match(r"^(Chapter|Topic)\s+\d", line):
+            if lines:
+                secs.append((title, lines))
+            title, lines, seen = line.replace(" — ", ". "), [], True
+        elif re.match(r"^(PART|QUICK-START)\b", line):
+            continue
+        elif line:
+            lines.append(line)
+    if lines:
+        secs.append((title, lines))
+    return secs
+
+
+def sections_from_md(text, only_fences=True):
+    secs, title, infence, buf = [], None, False, []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.strip().startswith("```"):
+            if infence and buf:
+                secs.append((title, buf)); buf = []
+            infence = not infence
+            continue
+        if infence:
+            if line.strip():
+                buf.append(line.strip())
+            continue
+        m = re.match(r"^##\s+(\d+(?:\.\d+)*)\b", line)
+        if m:
+            title = f"Chapter {m.group(1)}"
+        m = re.match(r"^#\s+.*?(\d+)\.\s+([A-Za-z].+)$", line)
+        if m:
+            title = f"Topic {m.group(1)}. {m.group(2)}"
+    if secs or only_fences:
+        return secs
+    plain = [re.sub(r"[#>*_`|]", " ", l).strip() for l in text.splitlines()]
+    return [(None, [l for l in plain if l])]
+
+
+def read_sources(uploaded, folder):
+    """-> list of (name, text)"""
+    items = []
+    for f in uploaded or []:
+        data = f.getvalue()
+        if f.name.lower().endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for n in sorted(z.namelist()):
+                    if n.lower().endswith((".txt", ".md")) and not n.endswith("/"):
+                        items.append((n, z.read(n).decode("utf-8", "ignore")))
+        else:
+            items.append((f.name, data.decode("utf-8", "ignore")))
+    if folder.strip():
+        p = Path(folder.strip()).expanduser()
+        if p.is_dir():
+            for fp in sorted(list(p.rglob("*.txt")) + list(p.rglob("*.md"))):
+                items.append((str(fp.relative_to(p)), fp.read_text(encoding="utf-8", errors="ignore")))
+        else:
+            st.warning(f"Folder not found: {p}")
+    return items
+
+
+def build_text(title, lines, repeat, announce):
+    parts = []
+    if announce and title:
+        parts.append(title.rstrip(".") + ".")
+    for s in lines:
+        s = s.strip()
+        if not s:
+            continue
+        if not re.search(r"[.?!…:;]$", s):
+            s += "."
+        parts.extend([s] * repeat)
+    return "\n\n".join(parts)
+
+
+@dataclass
+class Job:
+    path: Path
+    texts: list = field(default_factory=list)
+
+
+def make_jobs(items, outdir, mode, repeat, announce, only_fences):
+    jobs = []
+    for name, text in items:
+        p = Path(name)
+        stem = "__".join(p.with_suffix("").parts)
+        secs = sections_from_md(text, only_fences) if name.lower().endswith(".md") else sections_from_txt(text)
+        secs = [(t, l) for t, l in secs if l]
+        if not secs:
+            continue
+        texts = [(t, build_text(t, l, repeat, announce)) for t, l in secs]
+        if mode == "One MP3 per chapter":
+            for i, (t, body) in enumerate(texts, 1):
+                jobs.append(Job(outdir / stem / f"{i:03d}_{slug(t or 'section')}.mp3", [body]))
+        else:
+            jobs.append(Job(outdir / f"{stem}.mp3", [b for _, b in texts]))
+    return jobs
+
+
+async def run_batch(jobs, cfg, parallel, skip_existing, on_progress):
+    sem = asyncio.Semaphore(parallel)
+    results = {"done": 0, "skipped": 0, "failed": []}
+
+    async def work(job):
+        async with sem:
+            if skip_existing and job.path.exists() and job.path.stat().st_size > 0:
+                return job, "skipped", None
+            try:
+                audio = b"".join([await synth(t, cfg) for t in job.texts])
+                job.path.parent.mkdir(parents=True, exist_ok=True)
+                job.path.write_bytes(audio)
+                return job, "done", None
+            except Exception as e:  # noqa: BLE001
+                return job, "failed", str(e)
+
+    tasks = [asyncio.create_task(work(j)) for j in jobs]
+    finished = 0
+    for fut in asyncio.as_completed(tasks):
+        job, status, err = await fut
+        finished += 1
+        if status == "failed":
+            results["failed"].append((str(job.path), err))
+        else:
+            results[status] += 1
+        on_progress(finished, len(jobs), job.path.name, status)
+    return results
+
+
+def zip_folder(files):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:  # mp3 is already compressed
+        for f, root in files:
+            z.write(f, str(f.relative_to(root)))
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- UI
+def main():
+    st.set_page_config(page_title="Unlimited Text to Speech", page_icon="🔊", layout="wide")
+    st.title("🔊 Unlimited Text to Speech")
+    st.caption("Paste text or upload many files — no character, file-count or duration limit in this app.")
+
+    voices = load_voices()
+    if any(v.get("offline") for v in voices):
+        st.warning("Could not reach the voice list online — showing a small built-in list. Check your internet connection.")
+
+    with st.sidebar:
+        st.header("Voice")
+        langs = sorted({v["lang"] for v in voices})
+        lang = st.selectbox("Language", langs, index=langs.index("English") if "English" in langs else 0)
+        gender = st.radio("Gender", ["All", "Male", "Female"], horizontal=True)
+        pool = [v for v in voices if v["lang"] == lang and gender in ("All", v["gender"])] or [v for v in voices if v["lang"] == lang]
+        labels = [v["label"] for v in pool]
+        default = next((i for i, v in enumerate(pool) if v["short"] == "en-US-AriaNeural"), 0)
+        voice = pool[labels.index(st.selectbox("Voice", labels, index=default))]["short"]
+        speed = st.select_slider("Speed", [0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0], value=1.0, format_func=lambda x: f"{x}x")
+        pitch = st.slider("Pitch (Hz)", -50, 50, 0, 5)
+        volume = st.slider("Volume (%)", -50, 50, 0, 5)
+        cfg = dict(voice=voice, rate=f"{round((speed - 1) * 100):+d}%", pitch=f"{pitch:+d}Hz", volume=f"{volume:+d}%")
+
+        st.divider()
+        sample = st.text_input("Preview text", "Hello! This is a preview of this voice.")
+        if st.button("▶ Preview voice"):
+            try:
+                st.audio(asyncio.run(synth(sample, cfg)), format="audio/mp3")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Preview failed: {e}")
+
+    tab1, tab2 = st.tabs(["✍️ Single text", "📚 Batch files"])
+
+    # ---------------- single text
+    with tab1:
+        text = st.text_area("Text", height=320, placeholder="Enter text here… (any length)")
+        st.caption(f"{len(text):,} characters")
+        if st.button("Generate audio", type="primary", disabled=not text.strip()):
+            with st.spinner("Generating…"):
+                try:
+                    st.session_state["single"] = asyncio.run(synth(text, cfg))
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Failed: {e}")
+        if st.session_state.get("single"):
+            st.audio(st.session_state["single"], format="audio/mp3")
+            st.download_button("⬇ Download MP3", st.session_state["single"], "speech.mp3", "audio/mpeg")
+
+    # ---------------- batch
+    with tab2:
+        st.write("Upload **.txt / .md files or a .zip** (for example the `podcast/` folder from the course), "
+                 "or type a local folder path.")
+        uploaded = st.file_uploader("Files", type=["txt", "md", "zip"], accept_multiple_files=True)
+        folder = st.text_input("…or a local folder path (optional)", placeholder=r"C:\English-for-Shopping-Markdown\podcast")
+        c1, c2, c3 = st.columns(3)
+        mode = c1.radio("Output", ["One MP3 per chapter", "One MP3 per file (chapters merged)"])
+        repeat = c2.number_input("Read each sentence N times", 1, 5, 1, help="Handy for shadowing practice.")
+        parallel = c3.slider("Parallel requests", 1, 6, 3, help="Higher is faster but more likely to be throttled.")
+        d1, d2, d3 = st.columns(3)
+        announce = d1.checkbox("Read chapter titles aloud", True)
+        skip = d2.checkbox("Skip files already generated", True)
+        only_fences = d3.checkbox("In .md files read only the ```text podcast blocks", True)
+        outdir = Path(st.text_input("Save MP3 files to folder", "tts_output"))
+
+        items = read_sources(uploaded, folder)
+        jobs = make_jobs(items, outdir, mode, repeat, announce, only_fences) if items else []
+        if items:
+            chars = sum(len(t) for j in jobs for t in j.texts)
+            st.info(f"{len(items)} source file(s) → {len(jobs)} MP3 file(s), about {chars:,} characters.")
+
+        if st.button("Generate all", type="primary", disabled=not jobs):
+            bar = st.progress(0.0)
+            status = st.empty()
+            log = st.container()
+
+            def on_progress(done, total, name, st_):
+                bar.progress(done / total)
+                status.write(f"{done}/{total} — {name} ({st_})")
+
+            res = asyncio.run(run_batch(jobs, cfg, parallel, skip, on_progress))
+            bar.progress(1.0)
+            ok = [(j.path, outdir) for j in jobs if j.path.exists()]
+            st.success(f"Done: {res['done']} generated, {res['skipped']} skipped, {len(res['failed'])} failed. "
+                       f"Saved in: {outdir.resolve()}")
+            if res["failed"]:
+                with log.expander("Failed files (press Generate all again to retry only these)"):
+                    for p, e in res["failed"]:
+                        st.write(f"`{p}` — {e}")
+            if ok:
+                st.session_state["zip"] = zip_folder(ok)
+
+        if st.session_state.get("zip"):
+            st.download_button("⬇ Download everything as ZIP", st.session_state["zip"], "tts_audio.zip", "application/zip")
+
+
+main()
