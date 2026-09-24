@@ -7,6 +7,8 @@ Install & run:
 
 Features
   * Any language / gender / voice that edge-tts offers, speed / pitch / volume
+  * Bilingual tab: English lines read by an English voice, Persian lines by a Persian voice, plus a
+    study drill (English -> pause -> Persian -> English again, slower) for shadowing practice
   * PDF tab: upload a PDF, choose pages (e.g. 1-5, 8, 10-12), get one MP3 for the range / per page / every N pages
   * Voice gallery: listen to every voice of a language side by side, then pick one with a click
   * Single text tab: paste any amount of text (it is split into safe chunks automatically)
@@ -198,6 +200,7 @@ def build_text(title, lines, repeat, announce):
 class Job:
     path: Path
     texts: list = field(default_factory=list)
+    render: object = None  # optional async callable(ctx) -> mp3 bytes (used by the bilingual tab)
 
 
 def make_jobs(items, outdir, mode, repeat, announce, only_fences):
@@ -220,6 +223,7 @@ def make_jobs(items, outdir, mode, repeat, announce, only_fences):
 
 async def run_batch(jobs, cfg, parallel, skip_existing, on_progress):
     sem = asyncio.Semaphore(parallel)
+    piece_sem = asyncio.Semaphore(parallel)
     results = {"done": 0, "skipped": 0, "failed": []}
 
     async def work(job):
@@ -227,7 +231,10 @@ async def run_batch(jobs, cfg, parallel, skip_existing, on_progress):
             if skip_existing and job.path.exists() and job.path.stat().st_size > 0:
                 return job, "skipped", None
             try:
-                audio = b"".join([await synth(t, cfg) for t in job.texts])
+                if job.render:
+                    audio = await job.render({"sem": piece_sem, "cache": {}})
+                else:
+                    audio = b"".join([await synth(t, cfg) for t in job.texts])
                 job.path.parent.mkdir(parents=True, exist_ok=True)
                 job.path.write_bytes(audio)
                 return job, "done", None
@@ -359,6 +366,225 @@ def pdf_jobs(pages, stem, outdir, mode, every):
     return jobs
 
 
+# --------------------------------------------------------------------------- BILINGUAL
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\u20E3]")
+FA_CH = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
+LAT_CH = re.compile(r"[A-Za-z]")
+SKIP_TOKEN = re.compile(r"[—–→↔=|•·]+")
+
+
+def split_runs(line):
+    """One text line -> [(lang, text)], lang in {'en','fa'}. Words decide the language;
+    a single English word inside a Persian sentence stays Persian (voices switch only for real phrases)."""
+    toks = []
+    for w in line.split():
+        if SKIP_TOKEN.fullmatch(w):
+            continue
+        toks.append(["fa" if FA_CH.search(w) else "en" if LAT_CH.search(w) else "n", w])
+    kinds = {k for k, _ in toks}
+    if "fa" not in kinds:
+        return [("en", " ".join(w for _, w in toks))] if "en" in kinds else []
+    if "en" not in kinds:
+        return [("fa", " ".join(w for _, w in toks))]
+    last = None
+    for t in toks:                       # neutrals (numbers, punctuation) follow the previous word
+        if t[0] == "n":
+            t[0] = last
+        else:
+            last = t[0]
+    first = next(k for k, _ in toks if k)
+    for t in toks:
+        t[0] = t[0] or first
+    runs = []
+    for k, w in toks:
+        if runs and runs[-1][0] == k:
+            runs[-1][1].append(w)
+        else:
+            runs.append([k, [w]])
+    for r in runs:                       # tiny English bits inside Persian -> Persian
+        if r[0] == "en" and sum(1 for w in r[1] if LAT_CH.search(w)) < 2:
+            r[0] = "fa"
+    merged = []
+    for k, ws in runs:
+        if merged and merged[-1][0] == k:
+            merged[-1][1].extend(ws)
+        else:
+            merged.append([k, list(ws)])
+    return [(k, " ".join(ws)) for k, ws in merged]
+
+
+def line_items(text):
+    t = re.sub(r"[*_`~]+", "", text)
+    t = EMOJI_RE.sub("", t).replace("\u2019", "'").strip()
+    return split_runs(t) if t else []
+
+
+def bilingual_sections(name, text, skip_fences=True):
+    """[(title, [(lang, text), ...])]. Markdown files are split at '## 1.2 …' chapter headings."""
+    is_md = name.lower().endswith(".md")
+    chaptered = is_md and bool(re.search(r"(?m)^##\s+\d", text))
+    started = not chaptered
+    secs, title, items, infence = [], None, [], False
+
+    def flush():
+        if items:
+            secs.append((title, list(items)))
+            items.clear()
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.strip().startswith("```"):
+            infence = not infence
+            continue
+        if infence and skip_fences:
+            continue
+        m = re.match(r"^##\s+(\d+(?:\.\d+)*)\b", line) if is_md else None
+        if m:
+            flush(); title = f"Chapter {m.group(1)}"; started = True
+            continue
+        if not started or "English for Podcast" in line or re.match(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$", line):
+            continue
+        if line.strip().startswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c) or [c.lower() for c in cells] == ["english", "فارسی"]:
+                continue
+            for c in cells:
+                items.extend(line_items(c))
+            continue
+        line = re.sub(r"^\s*(#{1,6}|>+|[-*+]|\d+[.)])\s+", "", line)
+        items.extend(line_items(line))
+    flush()
+    return secs
+
+
+def make_cards(items, max_fa=160):
+    """Attach a Persian line that directly follows an English line to it as its translation."""
+    cards = []
+    for lang, text in items:
+        if lang == "en":
+            cards.append({"en": text, "fa": []})
+        elif cards and cards[-1]["en"] and not cards[-1]["fa"] and (not max_fa or len(text) <= max_fa):
+            cards[-1]["fa"].append(text)
+        else:
+            cards.append({"en": None, "fa": [text]})
+    return cards
+
+
+def tokens_for(items, mode, o):
+    """-> [('say', lang, text, slow) | ('pause', seconds)]"""
+    toks = []
+    if mode.startswith("Study drill"):
+        for c in make_cards(items, o["max_fa"]):
+            if c["en"]:
+                toks += [("say", "en", c["en"], False), ("pause", o["pause"])]
+                if o["read_fa"] and c["fa"]:
+                    toks += [("say", "fa", " ".join(c["fa"]), False), ("pause", o["pause"])]
+                for _ in range(o["repeats"] - 1):
+                    toks += [("say", "en", c["en"], True), ("pause", o["pause"])]
+            elif o["read_expl"]:
+                toks += [("say", "fa", " ".join(c["fa"]), False), ("pause", o["pause"])]
+        return toks
+    keep = [(l, t) for l, t in items if mode.startswith("Both") or (mode.startswith("English") and l == "en")
+            or (mode.startswith("Persian") and l == "fa")]
+    for lang, text in keep:
+        if o["pause"] <= 0 and toks and toks[-1][0] == "say" and toks[-1][1] == lang:
+            toks[-1] = ("say", lang, toks[-1][2] + "\n\n" + text, False)
+        else:
+            if toks and o["pause"] > 0:
+                toks.append(("pause", o["pause"]))
+            toks.append(("say", lang, text, False))
+    return toks
+
+
+# ---- silence without ffmpeg: build silent MP3 frames that match the header of the synthesized audio
+_BR = {3: [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320],
+       2: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160],
+       0: [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]}
+_SR = {3: [44100, 48000, 32000], 2: [22050, 24000, 16000], 0: [11025, 12000, 8000]}
+
+
+def mp3_silence(sample, seconds):
+    hdr, kbps, sr, spf = b"\xff\xf3\x54\xc0", 48, 24000, 576          # defaults = edge-tts (24 kHz, 48 kbps, mono)
+    try:
+        i = 0
+        if sample[:3] == b"ID3":
+            i = 10 + ((sample[6] << 21) | (sample[7] << 14) | (sample[8] << 7) | sample[9])
+        for j in range(i, min(len(sample) - 4, i + 4096)):
+            b1, b2 = sample[j + 1], sample[j + 2]
+            ver, layer = (b1 >> 3) & 3, (b1 >> 1) & 3
+            if sample[j] == 0xFF and (b1 & 0xE0) == 0xE0 and ver != 1 and layer == 1 and 0 < (b2 >> 4) < 15 and ((b2 >> 2) & 3) < 3:
+                kbps, sr = _BR[ver][b2 >> 4], _SR[ver][(b2 >> 2) & 3]
+                spf = 1152 if ver == 3 else 576
+                hdr = bytes([0xFF, b1 | 1, b2 & ~0x02, sample[j + 3]])  # no CRC, no padding
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    length = int((144 if spf == 1152 else 72) * kbps * 1000 / sr)
+    frame = hdr + b"\x00" * (length - 4)
+    return frame * max(1, int(-(-seconds * sr // spf)))
+
+
+def rate_str(mult):
+    return f"{max(-75, min(100, round((mult - 1) * 100))):+d}%"
+
+
+async def piece(ctx, text, voice, rate, pitch, volume):
+    key = (text, voice, rate, pitch, volume)
+    if key not in ctx["cache"]:
+        async with ctx["sem"]:
+            ctx["cache"][key] = await synth(text, dict(voice=voice, rate=rate, pitch=pitch, volume=volume))
+    return ctx["cache"][key]
+
+
+async def render_tokens(toks, ctx, voices, base):
+    say = [t for t in toks if t[0] == "say"]
+    if not say:
+        return b""
+
+    async def get(t):
+        _, lang, text, slow = t
+        speed = base["speed"] * (1 + base["slow"] / 100 if slow else 1)
+        return await piece(ctx, text, voices[lang], rate_str(speed), base["pitch"], base["volume"])
+
+    audios = await asyncio.gather(*[get(t) for t in say])
+    it, out = iter(audios), bytearray()
+    for t in toks:
+        if t[0] == "say":
+            out += next(it)
+        elif t[1] > 0:
+            out += mp3_silence(audios[0], t[1])
+    return bytes(out)
+
+
+def bilingual_jobs(items, outdir, per_chapter, mode, o, voices, base, announce, skip_fences):
+    jobs = []
+    for name, text in items:
+        stem = "__".join(Path(name).with_suffix("").parts)
+        secs = bilingual_sections(name, text, skip_fences)
+        if not secs:
+            continue
+        toks_list = []
+        for title, its in secs:
+            toks = tokens_for(its, mode, o)
+            if announce and title and toks:
+                toks = [("say", "en", title + ".", False), ("pause", 0.5)] + toks
+            if toks:
+                toks_list.append((title, toks))
+
+        def mk(toks):
+            async def render(ctx):
+                return await render_tokens(toks, ctx, voices, base)
+            return render
+
+        if per_chapter:
+            for i, (title, toks) in enumerate(toks_list, 1):
+                jobs.append(Job(outdir / stem / f"{i:03d}_{slug(title or 'section')}.mp3", [], mk(toks)))
+        elif toks_list:
+            allt = [t for _, ts in toks_list for t in ts]
+            jobs.append(Job(outdir / f"{stem}.mp3", [], mk(allt)))
+    return jobs
+
+
 @st.cache_data(show_spinner=False, max_entries=500)
 def preview_audio(voice, text, rate, pitch, volume):
     """Cached short sample so each voice is only generated once per setting."""
@@ -425,7 +651,7 @@ def main():
             except Exception as e:  # noqa: BLE001
                 st.error(f"Preview failed: {e}")
 
-    tab1, tab2, tab_pdf, tab3 = st.tabs(["✍️ Single text", "📚 Batch files", "📄 PDF", "🎙 Voice gallery"])
+    tab1, tab2, tab_pdf, tab_bi, tab3 = st.tabs(["✍️ Single text", "📚 Batch files", "📄 PDF", "🌐 Bilingual", "🎙 Voice gallery"])
 
     # ---------------- single text
     with tab1:
@@ -556,6 +782,110 @@ def main():
                                 st.audio(okf[0][0].read_bytes(), format="audio/mp3")
         if st.session_state.get("pdf_zip"):
             st.download_button("⬇ Download PDF audio as ZIP", st.session_state["pdf_zip"], "pdf_audio.zip", "application/zip")
+
+    # ---------------- bilingual
+    with tab_bi:
+        st.write("For files that mix **English and Persian** (like this course): each language is read by its own voice. "
+                 "The language is detected automatically, line by line.")
+        en_pool = [v for v in voices if v["locale"].startswith("en")]
+        fa_pool = [v for v in voices if v["locale"].startswith("fa")]
+        if not fa_pool:
+            st.warning("No Persian voice found in the voice list.")
+        vc1, vc2 = st.columns(2)
+        en_labels = [v["label"] for v in en_pool]
+        fa_labels = [v["label"] for v in fa_pool]
+        en_def = next((i for i, v in enumerate(en_pool) if v["short"] == (voice if voice.startswith("en") else "en-US-AriaNeural")), 0)
+        en_v = en_pool[en_labels.index(vc1.selectbox("English voice", en_labels, index=en_def))]["short"] if en_pool else voice
+        fa_def = next((i for i, v in enumerate(fa_pool) if v["short"] == "fa-IR-DilaraNeural"), 0)
+        fa_v = fa_pool[fa_labels.index(vc2.selectbox("Persian voice", fa_labels, index=fa_def))]["short"] if fa_pool else voice
+        voices_map = {"en": en_v, "fa": fa_v}
+
+        bmode = st.radio("What to make", [
+            "Study drill (English → Persian → English again)",
+            "Both languages in original order",
+            "English only",
+            "Persian only"])
+        o = dict(pause=0.0, repeats=1, read_fa=True, read_expl=False, max_fa=160)
+        slow = -30
+        if bmode.startswith("Study drill"):
+            d1, d2, d3 = st.columns(3)
+            o["repeats"] = d1.number_input("English repeats", 1, 3, 2, help="1 = once. Extra repeats are slower.")
+            slow = d2.slider("Speed of repeats (%)", -60, 0, -30, 5)
+            o["pause"] = d3.slider("Pause after each part (s)", 0.0, 6.0, 1.5, 0.5, help="Time to repeat aloud (shadowing).")
+            e1, e2, e3 = st.columns(3)
+            o["read_fa"] = e1.checkbox("Read the Persian translation", True)
+            o["read_expl"] = e2.checkbox("Also read Persian explanations", False)
+            o["max_fa"] = e3.number_input("Max length of a 'translation' (chars, 0 = any)", 0, 2000, 160,
+                                          help="A Persian line right after an English line counts as its translation if it is this short.")
+        else:
+            o["pause"] = st.slider("Pause between lines (s)", 0.0, 6.0, 0.0, 0.5,
+                                   help="0 = read continuously. Above 0 every line is a separate clip.")
+        base = dict(speed=speed, slow=slow, pitch=cfg["pitch"], volume=cfg["volume"])
+
+        src = st.radio("Source", ["Paste text", "Upload files (.txt / .md / .zip)"], horizontal=True)
+        b_items = []
+        if src == "Paste text":
+            pasted = st.text_area("Bilingual text", height=220, key="bi_text",
+                                  placeholder="Where is the bread?\nنان کجاست؟\n…")
+            if pasted.strip():
+                b_items = [("pasted.txt", pasted)]
+        else:
+            up = st.file_uploader("Files", type=["txt", "md", "zip"], accept_multiple_files=True, key="bi_files")
+            fold = st.text_input("…or a local folder path (optional)", key="bi_folder", placeholder=r"C:\English-for-Shopping-Markdown\parts")
+            b_items = read_sources(up, fold)
+        f1, f2, f3 = st.columns(3)
+        skip_fences = f1.checkbox("Skip ```text podcast blocks (duplicates)", True)
+        announce = f2.checkbox("Read chapter numbers aloud", True)
+        per_chapter = f3.radio("Output", ["One MP3 per chapter", "One MP3 per file"], horizontal=True) == "One MP3 per chapter"
+
+        parsed = [(n, bilingual_sections(n, t, skip_fences)) for n, t in b_items]
+        all_items = [it for _, secs in parsed for _, its in secs for it in its]
+        if all_items:
+            n_en = sum(1 for l, _ in all_items if l == "en")
+            st.info(f"Detected {n_en} English and {len(all_items) - n_en} Persian line(s) in "
+                    f"{sum(len(s) for _, s in parsed)} section(s).")
+            first = next((its for _, secs in parsed for _, its in secs if its), [])
+            with st.expander("Check the language detection (first lines)"):
+                st.dataframe([{"voice": "English" if l == "en" else "Persian", "text": t} for l, t in first[:40]],
+                             hide_index=True)
+            if st.button("🎧 Try the first few lines"):
+                sample = tokens_for(first[:14], bmode, o)
+                if sample:
+                    with st.spinner("Generating…"):
+                        try:
+                            ctx = {"sem": asyncio.Semaphore(3), "cache": {}}
+                            st.session_state["bi_try"] = asyncio.run(render_tokens(sample, ctx, voices_map, base))
+                        except Exception as e:  # noqa: BLE001
+                            st.error(f"Failed: {e}")
+            if st.session_state.get("bi_try"):
+                st.audio(st.session_state["bi_try"], format="audio/mp3")
+
+        bout = Path(st.text_input("Save MP3 files to folder", "tts_output", key="bi_out"))
+        g1, g2 = st.columns(2)
+        bskip = g1.checkbox("Skip files already generated", True, key="bi_skip")
+        bpar = g2.slider("Parallel requests", 1, 6, 3, key="bi_par")
+        bjobs = bilingual_jobs(b_items, bout, per_chapter, bmode, o, voices_map, base, announce, skip_fences) if b_items else []
+        if bjobs:
+            st.caption(f"{len(bjobs)} MP3 file(s) will be created.")
+        if st.button("Generate bilingual audio", type="primary", disabled=not bjobs):
+            bar = st.progress(0.0)
+            status = st.empty()
+
+            def on_bi(done, total_, name, st_):
+                bar.progress(done / total_)
+                status.write(f"{done}/{total_} — {name} ({st_})")
+
+            with st.spinner("Generating… drills need several requests per line, so this takes longer"):
+                res = asyncio.run(run_batch(bjobs, cfg, bpar, bskip, on_bi))
+            bar.progress(1.0)
+            st.success(f"Done: {res['done']} generated, {res['skipped']} skipped, {len(res['failed'])} failed. "
+                       f"Saved in: {bout.resolve()}")
+            for pth, err in res["failed"]:
+                st.error(f"`{pth}` — {err}")
+            okf = [(j.path, bout) for j in bjobs if j.path.exists()]
+            st.session_state["bi_zip"] = zip_folder(okf) if okf else None
+        if st.session_state.get("bi_zip"):
+            st.download_button("⬇ Download bilingual audio as ZIP", st.session_state["bi_zip"], "bilingual_audio.zip", "application/zip")
 
     # ---------------- voice gallery
     with tab3:
