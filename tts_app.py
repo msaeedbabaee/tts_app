@@ -2,11 +2,12 @@
 Unlimited Text-to-Speech (Streamlit + edge-tts)
 
 Install & run:
-    pip install streamlit edge-tts
+    pip install streamlit edge-tts pypdf
     streamlit run tts_app.py
 
 Features
   * Any language / gender / voice that edge-tts offers, speed / pitch / volume
+  * PDF tab: upload a PDF, choose pages (e.g. 1-5, 8, 10-12), get one MP3 for the range / per page / every N pages
   * Voice gallery: listen to every voice of a language side by side, then pick one with a click
   * Single text tab: paste any amount of text (it is split into safe chunks automatically)
   * Batch tab: upload many .txt / .md files or a whole .zip (e.g. the `podcast/` folder),
@@ -254,6 +255,110 @@ def zip_folder(files):
     return buf.getvalue()
 
 
+# --------------------------------------------------------------------------- PDF
+def parse_page_ranges(spec, total):
+    """'1-5, 8, 10-' -> [1,2,3,4,5,8,10,...]; '' or 'all' -> every page. 1-based."""
+    spec = spec.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")).strip().lower()
+    if spec in ("", "all", "*"):
+        return list(range(1, total + 1))
+    pages = []
+    for part in re.split(r"[,\s;،]+", spec):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d*)[-–—:](\d*)", part)
+        if m and (m.group(1) or m.group(2)):
+            a, b = int(m.group(1) or 1), int(m.group(2) or total)
+            pages.extend(range(min(a, b), max(a, b) + 1))
+        elif part.isdigit():
+            pages.append(int(part))
+        else:
+            raise ValueError(f"Cannot understand '{part}'. Use something like 1-5, 8, 10-12")
+    bad = sorted({p for p in pages if p < 1 or p > total})
+    if bad:
+        raise ValueError(f"Page(s) out of range (this PDF has {total} pages): {bad[:8]}")
+    seen, out = set(), []
+    for p in pages:
+        if p not in seen:
+            seen.add(p); out.append(p)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def pdf_page_count(data):
+    from pypdf import PdfReader
+    return len(PdfReader(io.BytesIO(data)).pages)
+
+
+@st.cache_data(show_spinner="Reading PDF…")
+def extract_pdf_pages(data, pages):
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(data))
+    return [(p, reader.pages[p - 1].extract_text() or "") for p in pages]
+
+
+FOREIGN_RE = re.compile(r"[\u0400-\u04FF\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]")
+PAGENUM_RE = re.compile(r"^\s*(page\s*)?\d{1,4}(\s*(of|/)\s*\d{1,4})?\s*$", re.I)
+
+
+def clean_pdf_pages(pages, rm_headers=True, rm_pagenums=True, skip_foreign=False):
+    """pages: [(no, raw_text)] -> [(no, clean_text)] with paragraphs re-flowed for speech."""
+    norm = lambda l: re.sub(r"\d+", "#", l.strip().lower())  # noqa: E731
+    page_lines = [(n, [l.rstrip() for l in t.splitlines()]) for n, t in pages]
+    repeated = set()
+    if rm_headers and len(page_lines) >= 3:
+        from collections import Counter
+        c = Counter()
+        for _, ls in page_lines:
+            ne = [l for l in ls if l.strip()]
+            for l in {norm(x) for x in ne[:2] + ne[-2:]}:
+                c[l] += 1
+        repeated = {l for l, k in c.items() if k >= max(2, 0.5 * len(page_lines)) and len(l) > 1}
+    out = []
+    for n, ls in page_lines:
+        keep = []
+        for l in ls:
+            if l.strip() and (norm(l) in repeated):
+                continue
+            if rm_pagenums and PAGENUM_RE.match(l):
+                continue
+            if skip_foreign and FOREIGN_RE.search(l):
+                continue
+            l = re.sub(r"^\s*[•▪●◦·]\s*", "", l)
+            keep.append(l.strip())
+        paras, cur = [], ""
+        for l in keep:
+            if not l:
+                if cur: paras.append(cur); cur = ""
+                continue
+            if cur.endswith("-") and l[:1].islower():
+                cur = cur[:-1] + l                      # de-hyphenate
+            elif cur and not re.search(r"[.!?:;…\"”)]$", cur):
+                cur += " " + l                          # wrapped line
+            else:
+                if cur: paras.append(cur)
+                cur = l
+        if cur:
+            paras.append(cur)
+        out.append((n, "\n\n".join(re.sub(r"\s+", " ", p).strip() for p in paras)))
+    return out
+
+
+def pdf_jobs(pages, stem, outdir, mode, every):
+    pages = [(n, t) for n, t in pages if t.strip()]
+    if not pages:
+        return []
+    if mode == "One MP3 per page":
+        return [Job(outdir / f"{stem}_page_{n:03d}.mp3", [t]) for n, t in pages]
+    step = len(pages) if mode == "One MP3 for the whole range" else max(1, int(every))
+    jobs = []
+    for i in range(0, len(pages), step):
+        grp = pages[i:i + step]
+        a, b = grp[0][0], grp[-1][0]
+        name = f"{stem}_page_{a:03d}.mp3" if a == b else f"{stem}_pages_{a:03d}-{b:03d}.mp3"
+        jobs.append(Job(outdir / name, ["\n\n".join(t for _, t in grp)]))
+    return jobs
+
+
 @st.cache_data(show_spinner=False, max_entries=500)
 def preview_audio(voice, text, rate, pitch, volume):
     """Cached short sample so each voice is only generated once per setting."""
@@ -320,7 +425,7 @@ def main():
             except Exception as e:  # noqa: BLE001
                 st.error(f"Preview failed: {e}")
 
-    tab1, tab2, tab3 = st.tabs(["✍️ Single text", "📚 Batch files", "🎙 Voice gallery"])
+    tab1, tab2, tab_pdf, tab3 = st.tabs(["✍️ Single text", "📚 Batch files", "📄 PDF", "🎙 Voice gallery"])
 
     # ---------------- single text
     with tab1:
@@ -381,6 +486,76 @@ def main():
 
         if st.session_state.get("zip"):
             st.download_button("⬇ Download everything as ZIP", st.session_state["zip"], "tts_audio.zip", "application/zip")
+
+    # ---------------- PDF
+    with tab_pdf:
+        st.write("Upload a PDF, choose the pages, and get audio. Works with PDFs that contain real text "
+                 "(scanned images need OCR first). Use a voice that matches the language of the text.")
+        try:
+            import pypdf  # noqa: F401
+            have_pypdf = True
+        except ImportError:
+            have_pypdf = False
+            st.error("pypdf is not installed. Run:  pip install pypdf")
+        pdf = st.file_uploader("PDF file", type=["pdf"], key="pdf_file") if have_pypdf else None
+        if pdf is not None:
+            data = pdf.getvalue()
+            try:
+                total = pdf_page_count(data)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Could not open this PDF: {e}")
+                total = 0
+            if total:
+                st.caption(f"{pdf.name} — {total} pages")
+                spec = st.text_input("Pages", "1-5", help="Examples: 1-5 · 3, 7, 9-12 · 10- (from 10 to the end) · all")
+                o1, o2, o3 = st.columns(3)
+                rm_head = o1.checkbox("Remove repeated headers/footers", True)
+                rm_num = o2.checkbox("Remove page numbers", True)
+                skip_foreign = o3.checkbox("Skip Persian/Arabic/other non-Latin lines", False,
+                                           help="Handy for bilingual PDFs: only the English lines are read.")
+                m1, m2 = st.columns(2)
+                pmode = m1.radio("Output", ["One MP3 for the whole range", "One MP3 per page", "One MP3 every N pages"])
+                every = m2.number_input("N (pages per MP3)", 1, 500, 5, disabled=pmode != "One MP3 every N pages")
+                pout = Path(st.text_input("Save MP3 files to folder", "tts_output", key="pdf_out"))
+                try:
+                    wanted = parse_page_ranges(spec, total)
+                except ValueError as e:
+                    st.error(str(e)); wanted = []
+                if wanted:
+                    raw = extract_pdf_pages(data, tuple(wanted))
+                    cleaned = clean_pdf_pages(raw, rm_head, rm_num, skip_foreign)
+                    full = "\n\n".join(t for _, t in cleaned)
+                    if not full.strip():
+                        st.warning("No text found on these pages. The PDF may be scanned images (OCR needed) "
+                                   "or every line was filtered out.")
+                    else:
+                        minutes = len(full) / 14 / 60 / max(0.25, float(speed))
+                        st.info(f"{len(wanted)} page(s) selected · {len(full):,} characters · roughly {minutes:.0f} min of audio")
+                        with st.expander("Preview extracted text"):
+                            st.text(full[:6000] + ("\n…" if len(full) > 6000 else ""))
+                        if st.button("Generate PDF audio", type="primary"):
+                            stem = slug(Path(pdf.name).stem, 40)
+                            jobs = pdf_jobs(cleaned, stem, pout, pmode, every)
+                            bar = st.progress(0.0)
+                            status = st.empty()
+
+                            def on_prog(done, total_, name, st_):
+                                bar.progress(done / total_)
+                                status.write(f"{done}/{total_} — {name} ({st_})")
+
+                            with st.spinner("Generating… long ranges can take a while"):
+                                res = asyncio.run(run_batch(jobs, cfg, 3, False, on_prog))
+                            bar.progress(1.0)
+                            st.success(f"Done: {res['done']} file(s) generated, {len(res['failed'])} failed. "
+                                       f"Saved in: {pout.resolve()}")
+                            for pth, err in res["failed"]:
+                                st.error(f"`{pth}` — {err}")
+                            okf = [(j.path, pout) for j in jobs if j.path.exists()]
+                            st.session_state["pdf_zip"] = zip_folder(okf) if okf else None
+                            if len(okf) == 1:
+                                st.audio(okf[0][0].read_bytes(), format="audio/mp3")
+        if st.session_state.get("pdf_zip"):
+            st.download_button("⬇ Download PDF audio as ZIP", st.session_state["pdf_zip"], "pdf_audio.zip", "application/zip")
 
     # ---------------- voice gallery
     with tab3:
