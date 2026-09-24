@@ -7,6 +7,7 @@ Install & run:
 
 Features
   * Any language / gender / voice that edge-tts offers, speed / pitch / volume
+  * Voice gallery: listen to every voice of a language side by side, then pick one with a click
   * Single text tab: paste any amount of text (it is split into safe chunks automatically)
   * Batch tab: upload many .txt / .md files or a whole .zip (e.g. the `podcast/` folder),
     or point to a local folder. One MP3 per chapter or one MP3 per file. Everything is
@@ -253,6 +254,34 @@ def zip_folder(files):
     return buf.getvalue()
 
 
+@st.cache_data(show_spinner=False, max_entries=500)
+def preview_audio(voice, text, rate, pitch, volume):
+    """Cached short sample so each voice is only generated once per setting."""
+    return asyncio.run(synth(text, dict(voice=voice, rate=rate, pitch=pitch, volume=volume), retries=3))
+
+
+async def _preview_many(shorts, text, cfg, parallel, on_progress):
+    sem = asyncio.Semaphore(parallel)
+    out, errors = {}, {}
+
+    async def one(short):
+        async with sem:
+            try:
+                out[short] = await synth(text, dict(cfg, voice=short), retries=3)
+            except Exception as e:  # noqa: BLE001
+                errors[short] = str(e)
+
+    tasks = [asyncio.create_task(one(sh)) for sh in shorts]
+    for i, t in enumerate(asyncio.as_completed(tasks), 1):
+        await t
+        on_progress(i, len(tasks))
+    return out, errors
+
+
+def use_voice(label):
+    st.session_state["voice_label"] = label
+
+
 # --------------------------------------------------------------------------- UI
 def main():
     st.set_page_config(page_title="Unlimited Text to Speech", page_icon="🔊", layout="wide")
@@ -271,7 +300,13 @@ def main():
         pool = [v for v in voices if v["lang"] == lang and gender in ("All", v["gender"])] or [v for v in voices if v["lang"] == lang]
         labels = [v["label"] for v in pool]
         default = next((i for i, v in enumerate(pool) if v["short"] == "en-US-AriaNeural"), 0)
-        voice = pool[labels.index(st.selectbox("Voice", labels, index=default))]["short"]
+        if st.session_state.get("voice_label") not in labels:
+            st.session_state.pop("voice_label", None)
+        if "voice_label" in st.session_state:  # set by a "Use" button or a previous run
+            chosen = st.selectbox("Voice", labels, key="voice_label")
+        else:
+            chosen = st.selectbox("Voice", labels, index=default, key="voice_label")
+        voice = pool[labels.index(chosen)]["short"]
         speed = st.select_slider("Speed", [0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0], value=1.0, format_func=lambda x: f"{x}x")
         pitch = st.slider("Pitch (Hz)", -50, 50, 0, 5)
         volume = st.slider("Volume (%)", -50, 50, 0, 5)
@@ -285,7 +320,7 @@ def main():
             except Exception as e:  # noqa: BLE001
                 st.error(f"Preview failed: {e}")
 
-    tab1, tab2 = st.tabs(["✍️ Single text", "📚 Batch files"])
+    tab1, tab2, tab3 = st.tabs(["✍️ Single text", "📚 Batch files", "🎙 Voice gallery"])
 
     # ---------------- single text
     with tab1:
@@ -346,6 +381,48 @@ def main():
 
         if st.session_state.get("zip"):
             st.download_button("⬇ Download everything as ZIP", st.session_state["zip"], "tts_audio.zip", "application/zip")
+
+    # ---------------- voice gallery
+    with tab3:
+        st.write(f"Listen to the **{len(pool)}** voice(s) for **{lang}** "
+                 f"({'all genders' if gender == 'All' else gender.lower()}). Change language / gender in the sidebar. "
+                 "Speed, pitch and volume from the sidebar are applied to the samples.")
+        gtext = st.text_input("Sample text", "Hello! Where can I find the olive oil, please?", key="gallery_text")
+        gallery = st.session_state.setdefault("gallery", {})
+        key_now = (gtext, cfg["rate"], cfg["pitch"], cfg["volume"])
+        if st.session_state.get("gallery_key") != key_now:  # settings changed -> old samples are stale
+            gallery.clear()
+            st.session_state["gallery_key"] = key_now
+
+        if st.button(f"⏬ Generate samples for all {len(pool)} voices", disabled=not gtext.strip()):
+            todo = [v["short"] for v in pool if v["short"] not in gallery]
+            if todo:
+                bar = st.progress(0.0)
+                out, errors = asyncio.run(_preview_many(todo, gtext, cfg, 3, lambda i, n: bar.progress(i / n)))
+                gallery.update(out)
+                bar.empty()
+                if errors:
+                    st.warning(f"{len(errors)} sample(s) failed — press the button again to retry them.")
+
+        last = st.session_state.pop("last_played", None)
+        for v in pool:
+            c_name, c_play, c_use, c_audio = st.columns([3.2, 1, 1, 4])
+            c_name.markdown(f"{'♂' if v['gender'] == 'Male' else '♀'} **{v['label']}**  \n`{v['short']}`")
+            if c_play.button("▶ Play", key=f"play_{v['short']}"):
+                with st.spinner("…"):
+                    try:
+                        gallery[v["short"]] = preview_audio(v["short"], gtext, cfg["rate"], cfg["pitch"], cfg["volume"])
+                        last = v["short"]
+                    except Exception as e:  # noqa: BLE001
+                        c_audio.error(f"Failed: {e}")
+            c_use.button("✔ Use", key=f"use_{v['short']}", on_click=use_voice, args=(v["label"],),
+                         type="primary" if v["short"] == voice else "secondary")
+            if v["short"] in gallery:
+                try:
+                    c_audio.audio(gallery[v["short"]], format="audio/mp3", autoplay=(v["short"] == last))
+                except TypeError:  # older Streamlit without autoplay
+                    c_audio.audio(gallery[v["short"]], format="audio/mp3")
+            st.divider()
 
 
 main()
