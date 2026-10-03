@@ -17,6 +17,7 @@ Features
     saved to a local folder and offered as one ZIP. Runs can be resumed (finished files are skipped).
   * Every tab can export, per section (chapter / page part) and/or for the whole topic, any mix of:
       MP3 audio, Markdown (.md) and PDF (Persian + English, right-to-left aware). Tick what you want.
+      Markdown / PDF can also be one book for all files (cover, contents with page numbers, bookmarks).
   * The Single text tab can also make a small MP4 slideshow (one slide per sentence, audio repeated N times).
       Files with the same name sit side by side: 001_Chapter_1.mp3 / .md / .pdf
   * The app itself has no character, file-count or duration limit.
@@ -277,7 +278,7 @@ def _md_line(t):
     return "\\" + t if t[:1] in "#>" else t
 
 
-def render_md(title, sections, nested):
+def render_md(title, sections, nested, book=None):
     """nested=True -> the whole topic ('# topic' / '## section'); False -> a single section file."""
     out = []
 
@@ -290,7 +291,14 @@ def render_md(title, sections, nested):
             else:
                 out.extend([_md_line(b[1]), ""])
 
-    if nested:
+    if book is not None:                         # one book: '# book' / '## file' / '### chapter'
+        out.extend([f"# {title}", ""])
+        for g in book:
+            out.extend([f"## {g.title}", ""])
+            for s in g.sections:
+                out.extend([f"### {s.title}", ""])
+                add(s.blocks, 4)
+    elif nested:
         out.extend([f"# {title}", ""])
         for s in sections:
             out.extend([f"## {s.title}", ""])
@@ -353,7 +361,10 @@ def is_rtl(text):
     return FA_CH.search(text) is not None and len(FA_CH.findall(text)) >= len(LAT_CH.findall(text))
 
 
-def render_pdf(title, sections, nested, font):
+TOC_ROWS = 30
+
+
+def render_pdf(title, sections, nested, font, book=None):
     """Bilingual-safe PDF: Persian is shaped + right-to-left, English left-to-right, line by line."""
     from fpdf import FPDF
 
@@ -378,7 +389,7 @@ def render_pdf(title, sections, nested, font):
     pdf.set_creator("Unlimited Text to Speech")
     pdf.add_page()
 
-    def para(text, size=12, style="", color=(0, 0, 0), gap=2.5, keep=0):
+    def para(text, size=12, style="", color=(0, 0, 0), gap=2.5, keep=0, align=None):
         if keep and pdf.will_page_break(keep):
             pdf.add_page()
         for ln in text.split("\n"):
@@ -389,7 +400,7 @@ def render_pdf(title, sections, nested, font):
             pdf.set_text_shaping(True, direction="rtl" if rtl else "ltr")
             pdf.set_font("TTS", style, size)
             pdf.set_text_color(*color)
-            pdf.multi_cell(0, size * 0.62, ln, align="R" if rtl else "L", new_x="LMARGIN", new_y="NEXT")
+            pdf.multi_cell(0, size * 0.62, ln, align=align or ("R" if rtl else "L"), new_x="LMARGIN", new_y="NEXT")
         pdf.ln(gap)
 
     def add(blocks, sizes):
@@ -402,7 +413,42 @@ def render_pdf(title, sections, nested, font):
             else:
                 para(b[1])
 
-    if nested:
+    if book is not None:
+        n_sec = sum(len(g.sections) for g in book)
+        pdf.set_y(95)                                            # cover
+        para(title, 30, "B", gap=6, align="C")
+        para(f"{len(book)} files · {n_sec} chapters", 12, "", (110, 110, 110), align="C")
+
+        def toc(p, outline):                                     # contents with page numbers
+            p.set_xy(18, 18)
+            p.set_text_shaping(True, direction="ltr")
+            p.set_font("TTS", "B", 20)
+            p.set_text_color(0, 0, 0)
+            p.cell(0, 12, "Contents", new_x="LMARGIN", new_y="NEXT")
+            p.ln(4)
+            for k, e in enumerate(outline):
+                if k and k % TOC_ROWS == 0:                      # fixed rows per page -> page count is exact
+                    p.add_page()
+                rtl = is_rtl(e.name)
+                p.set_text_shaping(True, direction="rtl" if rtl else "ltr")
+                p.set_font("TTS", "B" if e.level == 0 else "", 11.5 if e.level == 0 else 10.5)
+                p.set_x(18 + 6 * e.level)
+                p.cell(174 - 6 * e.level - 14, 7, e.name[:80], align="R" if rtl else "L")
+                p.set_text_shaping(True, direction="ltr")
+                p.cell(14, 7, str(e.page_number), align="R", new_x="LMARGIN", new_y="NEXT")
+
+        pdf.add_page()
+        pdf.insert_toc_placeholder(toc, pages=max(1, -(-(len(book) + n_sec) // TOC_ROWS)))
+        for i, g in enumerate(book):
+            if i:                                                # the contents placeholder already left us on a fresh page
+                pdf.add_page()
+            pdf.start_section(g.title, 0)
+            para(g.title, 22, "B", gap=5)
+            for s in g.sections:
+                pdf.start_section(s.title, 1)
+                para(s.title, 15, "B", (30, 60, 130), 3, keep=35)
+                add(s.blocks, 12.5)
+    elif nested:
         para(title, 20, "B", gap=5)
         for s in sections:
             para(s.title, 15, "B", (30, 60, 130), 3, keep=35)
@@ -584,8 +630,16 @@ async def build_video(ctx, secs, title, voices, base, vo, font):
         return Path(td, "out.mp4").read_bytes()
 
 
-def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False):
-    """fmts: {'mp3'|'md'|'pdf': 'section'|'file'|'both'} -> [Task]. Files sit side by side with the same base name."""
+def levels_of(gran):
+    """'section' | 'file' | 'both' (old style) or a set of {'section','file','book'} -> set of levels."""
+    if isinstance(gran, str):
+        return {"both": {"section", "file"}}.get(gran, {gran})
+    return set(gran or ())
+
+
+def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False, book_title="Book"):
+    """fmts: {'mp3'|'md'|'pdf': levels} -> [Task]. Levels: per section, per file, and (md/pdf) one book for all files.
+    Files sit side by side with the same base name."""
     tasks = []
 
     def mk(ext, path, secs, title, nested, phase=0, reuse=False):
@@ -605,8 +659,9 @@ def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False):
             gran = fmts.get(ext)
             if not gran or not g.sections:
                 continue
-            want_sec, want_file = gran in ("section", "both"), gran in ("file", "both")
-            if gran == "both" and len(g.sections) == 1:
+            lv = levels_of(gran)
+            want_sec, want_file = "section" in lv, "file" in lv
+            if want_sec and want_file and len(g.sections) == 1:
                 want_sec = False                       # a single section: both files would be identical
             if want_sec:
                 for s in g.sections:
@@ -615,6 +670,16 @@ def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False):
                 reuse = ext == "mp3" and (want_sec or reuse_existing)
                 tasks.append(mk(ext, outdir / f"{g.name}.{ext}", g.sections, g.title, True,
                                 phase=1 if ext == "mp3" else 0, reuse=reuse))
+
+    def mk_book(ext, path):
+        async def run(ctx):
+            return (render_md(book_title, None, True, book=groups) if ext == "md"
+                    else render_pdf(book_title, None, True, font, book=groups))
+        return Task(path, run, ext)
+
+    for ext in ("md", "pdf"):
+        if groups and "book" in levels_of(fmts.get(ext)):
+            tasks.append(mk_book(ext, outdir / f"{slug(book_title, 60)}.{ext}"))
     return tasks
 
 
@@ -1034,7 +1099,7 @@ def use_voice(label):
     st.session_state["voice_label"] = label
 
 
-def export_panel(key, per_label="Per section", whole_label="Whole topic", allow_gran=True, video=False):
+def export_panel(key, per_label="Per section", whole_label="Whole topic", allow_gran=True, video=False, book=False):
     """Tick-boxes for MP3 / Markdown / PDF, each with its own granularity -> {'mp3': 'section'|'file'|'both', ...}"""
     st.markdown("**What do you want to get?**")
     labels = {"section": per_label, "file": whole_label, "both": f"Both ({per_label.lower()} + {whole_label.lower()})"}
@@ -1043,8 +1108,19 @@ def export_panel(key, per_label="Per section", whole_label="Whole topic", allow_
     for col, ext in zip(st.columns(len(exts)), exts):
         with col:
             if st.checkbox(FORMAT_LABELS[ext], value=(ext == "mp3"), key=f"{key}_{ext}_on"):
+                if book and ext in ("md", "pdf"):                # any mix of: chapters / files / one book
+                    lv = {"section": per_label, "file": whole_label, "book": "One book (all files)"}
+                    pick = st.multiselect(f"{ext} levels", list(lv), default=["section"], format_func=lv.get,
+                                          key=f"{key}_{ext}_lv", label_visibility="collapsed")
+                    if pick:
+                        out[ext] = set(pick)
+                    else:
+                        st.caption("⚠ pick at least one")
+                    continue
                 out[ext] = st.selectbox(f"{ext} granularity", list(labels), format_func=labels.get,
                                         key=f"{key}_{ext}_gran", label_visibility="collapsed") if allow_gran else "section"
+    if book and any("book" in v for k, v in out.items() if k in ("md", "pdf")):
+        st.text_input("Book title (also the file name)", "Book", key=f"{key}_book_title")
     if not out:
         st.warning("Tick at least one output.")
     return out
@@ -1209,13 +1285,14 @@ def main():
         announce = d1.checkbox("Read chapter titles aloud", True)
         skip = d2.checkbox("Skip MP3 files already generated", True)
         only_fences = d3.checkbox("In .md files read only the ```text podcast blocks", True)
-        fmts = export_panel("batch", "Per chapter", "Whole file")
+        fmts = export_panel("batch", "Per chapter", "Per file", book=True)
         outdir = Path(st.text_input("Save files to folder", "tts_output"))
 
         font = get_pdf_font(fmts, font_bytes)
         items = read_sources(uploaded, folder)
         groups = make_groups(items, repeat, announce, only_fences) if items else []
-        tasks = plan_tasks(groups, outdir, fmts, cfg, font or None, skip) if groups and fmts and font is not False else []
+        tasks = plan_tasks(groups, outdir, fmts, cfg, font or None, skip,
+                           st.session_state.get("batch_book_title") or "Book") if groups and fmts and font is not False else []
         if items:
             chars = sum(len(t) for g in groups for s in g.sections for t in s.texts)
             st.info(f"{len(items)} source file(s) → {sum(len(g.sections) for g in groups)} chapter(s), about {chars:,} characters. "
@@ -1366,7 +1443,7 @@ def main():
         f1, f2 = st.columns(2)
         skip_fences = f1.checkbox("Skip ```text podcast blocks (duplicates)", True)
         announce = f2.checkbox("Read chapter numbers aloud", True)
-        bfmts = export_panel("bi", "Per chapter", "Whole file")
+        bfmts = export_panel("bi", "Per chapter", "Per file", book=True)
 
         parsed = [(n, bilingual_sections(n, t, skip_fences)) for n, t in b_items]
         all_items = [it for _, secs in parsed for _, its in secs for it in its]
@@ -1396,7 +1473,8 @@ def main():
         bpar = g2.slider("Parallel requests", 1, 6, 3, key="bi_par")
         bfont = get_pdf_font(bfmts, font_bytes)
         bgroups = bilingual_groups(b_items, bmode, o, voices_map, base, announce, skip_fences) if b_items else []
-        btasks = plan_tasks(bgroups, bout, bfmts, cfg, bfont or None, bskip) if bgroups and bfmts and bfont is not False else []
+        btasks = plan_tasks(bgroups, bout, bfmts, cfg, bfont or None, bskip,
+                            st.session_state.get("bi_book_title") or "Book") if bgroups and bfmts and bfont is not False else []
         if bgroups:
             st.caption(f"Will create: {describe_tasks(btasks)}.")
             if bfont:
