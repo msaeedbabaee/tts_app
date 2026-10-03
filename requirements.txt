@@ -1,3 +1,5 @@
 streamlit
 edge-tts
 pypdf
+fpdf2>=2.8.9
+uharfbuzz
