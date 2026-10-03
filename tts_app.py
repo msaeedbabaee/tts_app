@@ -16,7 +16,8 @@ Features
     or point to a local folder. One MP3 per chapter or one MP3 per file. Everything is
     saved to a local folder and offered as one ZIP. Runs can be resumed (finished files are skipped).
   * Every tab can export, per section (chapter / page part) and/or for the whole topic, any mix of:
-      MP3 audio, Markdown (.md) and PDF (Persian + English, right-to-left aware). Tick what you want.
+      MP3 audio, Markdown (.md), PDF (Persian + English, right-to-left aware) and a small MP4 slideshow
+      (one slide per sentence, audio repeated N times, then the next slide). Tick what you want.
       Files with the same name sit side by side: 001_Chapter_1.mp3 / .md / .pdf
   * The app itself has no character, file-count or duration limit.
     (Only the online Microsoft service behind edge-tts can throttle you; the app retries automatically.)
@@ -25,6 +26,7 @@ import asyncio
 import hashlib
 import io
 import re
+import shutil
 import tempfile
 import urllib.request
 import zipfile
@@ -210,12 +212,20 @@ def build_text(title, lines, repeat, announce):
 # the document blocks that mirror it, so MP3 / Markdown / PDF are always built from the same data.
 #   blocks: [("h", text) sub-heading | ("p", text) paragraph | ("qa", english, persian) pair]
 @dataclass
+class Card:
+    """One slide of the video: what is shown (same block format as Section.blocks) and what is spoken once."""
+    show: list
+    tokens: list                                 # [("say", lang, text, slow) | ("pause", seconds)]
+
+
+@dataclass
 class Section:
     name: str                                    # output path inside the folder, without extension
     title: str
     blocks: list = field(default_factory=list)
     texts: list = field(default_factory=list)    # plain texts for TTS (one voice)
     render: object = None                        # async callable(ctx) -> mp3 bytes (bilingual tab)
+    cards: list = field(default_factory=list)    # slides for the video
 
 
 @dataclass
@@ -234,7 +244,7 @@ class Task:
     skip_ok: bool = False                        # may be skipped when the file already exists
 
 
-FORMAT_LABELS = {"mp3": "🔊 Audio (MP3)", "md": "📝 Markdown (.md)", "pdf": "📄 PDF"}
+FORMAT_LABELS = {"mp3": "🔊 Audio (MP3)", "md": "📝 Markdown (.md)", "pdf": "📄 PDF", "mp4": "🎬 Video (MP4)"}
 GRAN = {"section": "Per section", "file": "Whole topic", "both": "Both"}
 
 
@@ -249,10 +259,17 @@ def make_groups(items, repeat, announce, only_fences):
         if not secs:
             continue
         sections = [Section(name=f"{stem}/{i:03d}_{slug(t or 'section')}", title=t or f"Section {i}",
-                            blocks=[("p", ln) for ln in lines], texts=[build_text(t, lines, repeat, announce)])
+                            blocks=[("p", ln) for ln in lines], texts=[build_text(t, lines, repeat, announce)],
+                            cards=text_cards(lines))
                     for i, (t, lines) in enumerate(secs, 1)]
         groups.append(Group(stem, p.stem, sections))
     return groups
+
+
+def text_cards(paragraphs):
+    """Plain text -> slides: long paragraphs are split at sentence ends into slide-sized chunks."""
+    return [Card([("p", ch)], [("say", "en", ch, False)])
+            for p in paragraphs for ch in split_text(p, 220) if ch.strip()]
 
 
 # ---- building the individual files
@@ -410,7 +427,174 @@ async def section_audio(ctx, secs, cfg, outdir, reuse):
     return b"".join(await asyncio.gather(*[one(s) for s in secs]))
 
 
-def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False):
+# --------------------------------------------------------------------------- VIDEO (slideshow)
+# One slide per Card. The slide stays on screen while its audio plays `repeats` times, then the
+# next slide appears. Because we build the audio ourselves, every slide's start/end time is exact.
+VIDEO_SIZES = {"Small (640×360)": (640, 360), "Medium (854×480)": (854, 480), "HD (1280×720)": (1280, 720)}
+VIDEO_FPS = 5          # slides are static, so a low frame rate keeps the files tiny
+VIDEO_CRF = 28
+
+
+def find_ffmpeg():
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def video_deps_ok():
+    try:
+        import pypdfium2  # noqa: F401
+    except ImportError:
+        return False
+    return find_ffmpeg() is not None
+
+
+def mp3_duration(data):
+    """Exact duration (seconds) of raw MP3 bytes by walking the frame headers."""
+    i, n, total = 0, len(data), 0.0
+    while i + 4 <= n:
+        if data[i:i + 3] == b"ID3":
+            i += 10 + ((data[i + 6] << 21) | (data[i + 7] << 14) | (data[i + 8] << 7) | data[i + 9])
+            continue
+        b1, b2 = data[i + 1], data[i + 2]
+        ver, layer, br_i, sr_i = (b1 >> 3) & 3, (b1 >> 1) & 3, b2 >> 4, (b2 >> 2) & 3
+        if data[i] == 0xFF and (b1 & 0xE0) == 0xE0 and ver != 1 and layer == 1 and 0 < br_i < 15 and sr_i < 3:
+            kbps, sr = _BR[ver][br_i], _SR[ver][sr_i]
+            spf = 1152 if ver == 3 else 576
+            total += spf / sr
+            i += int((144 if spf == 1152 else 72) * kbps * 1000 / sr) + ((b2 >> 1) & 1)
+        else:
+            i += 1
+    return total
+
+
+async def card_audio(ctx, card, voices, base, vo):
+    """One slide's audio: the card spoken `repeats` times, each followed by `gap` seconds of silence."""
+    one = await render_tokens(card.tokens, ctx, voices, base)
+    if not one:
+        return b""
+    return (one + (mp3_silence(one, vo["gap"]) if vo["gap"] > 0 else b"")) * vo["repeats"]
+
+
+def render_slides(items, font, size, dark, folder):
+    """items: [(section_title, card)] -> PNG paths. Drawn with fpdf2 (Persian shaping + RTL), rasterized by pdfium."""
+    from fpdf import FPDF
+    import pypdfium2 as pdfium
+
+    W, H = size
+    mw, mh, mg = 254.0, 254.0 * H / W, 16.0
+    reg, bold = font
+    bg, fg, dim, acc = (((18, 18, 18), (255, 255, 255), (150, 150, 150), (30, 215, 96)) if dark
+                        else ((250, 250, 246), (20, 20, 20), (105, 105, 105), (20, 146, 63)))
+    pdf = FPDF(unit="mm", format=(mw, mh))
+    pdf.set_auto_page_break(False)
+    pdf.set_margin(0)
+    pdf.add_font("TTS", "", str(reg))
+    pdf.add_font("TTS", "B", str(bold))
+
+    def set_f(text, style, pt):
+        pdf.set_text_shaping(True, direction="rtl" if is_rtl(text) else "ltr")
+        pdf.set_font("TTS", style, pt)
+
+    w, top, bottom = mw - 2 * mg, 22.0, 14.0
+    for i, (title, card) in enumerate(items, 1):
+        pdf.add_page()
+        pdf.set_fill_color(*bg)
+        pdf.rect(0, 0, mw, mh, "F")
+        texts = []                                   # (text, style, colour)
+        for b in card.show:
+            if b[0] == "qa":
+                texts += [(b[1], "B", fg), (b[2], "", acc)]
+            else:
+                texts.append((b[1], "B" if not is_rtl(b[1]) else "", fg))
+        pt = 16
+        for cand in range(46, 15, -2):
+            tot = 0
+            for t, st_, _ in texts:
+                set_f(t, st_, cand)
+                tot += len(pdf.multi_cell(w, cand * .55, t, align="C", dry_run=True, output="LINES")) * cand * .55 + 7
+            if tot - 7 <= mh - top - bottom:
+                pt = cand
+                break
+        lh = pt * .55
+        heights = []
+        for t, st_, _ in texts:
+            set_f(t, st_, pt)
+            heights.append(len(pdf.multi_cell(w, lh, t, align="C", dry_run=True, output="LINES")) * lh)
+        y = top + max(0, (mh - top - bottom - sum(heights) - 7 * (len(texts) - 1)) / 2)
+        for (t, st_, col), hh in zip(texts, heights):
+            set_f(t, st_, pt)
+            pdf.set_text_color(*col)
+            pdf.set_xy(mg, y)
+            pdf.multi_cell(w, lh, t, align="C")
+            y += hh + 7
+        set_f(title, "", 11)                         # header: section title + counter, footer: progress bar
+        pdf.set_text_color(*dim)
+        pdf.set_xy(mg, 7)
+        pdf.cell(w * .8, 7, title[:70])
+        pdf.set_text_shaping(True, direction="ltr")
+        pdf.set_xy(mw - mg - 40, 7)
+        pdf.cell(40, 7, f"{i} / {len(items)}", align="R")
+        pdf.set_fill_color(*[int(c * .25 + b * .75) for c, b in zip(fg, bg)])
+        pdf.rect(0, mh - 2.4, mw, 2.4, "F")
+        pdf.set_fill_color(*acc)
+        pdf.rect(0, mh - 2.4, mw * i / len(items), 2.4, "F")
+    doc = pdfium.PdfDocument(bytes(pdf.output()))
+    scale = W / (mw / 25.4 * 72)
+    paths = []
+    for i in range(len(doc)):
+        p = Path(folder) / f"s{i:05d}.png"
+        doc[i].render(scale=scale).to_pil().convert("RGB").save(p)
+        paths.append(p)
+    doc.close()
+    return paths
+
+
+def run_ffmpeg(args, cwd):
+    import subprocess
+    r = subprocess.run([find_ffmpeg(), "-y", "-loglevel", "error", *args], cwd=cwd, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError("ffmpeg failed: " + r.stderr.strip()[-400:])
+
+
+async def build_video(ctx, secs, title, voices, base, vo, font):
+    """MP4 slideshow for one or more sections."""
+    items = [(s.title, c) for s in secs for c in s.cards]
+    audios = await asyncio.gather(*[card_audio(ctx, c, voices, base, vo) for _, c in items])
+    keep = [(it, a) for it, a in zip(items, audios) if a]
+    if not keep:
+        raise RuntimeError("nothing to speak")
+    with tempfile.TemporaryDirectory() as td:
+        slides = await asyncio.to_thread(render_slides, [it for it, _ in keep], font, vo["size"], vo["dark"], td)
+        Path(td, "audio.mp3").write_bytes(b"".join(a for _, a in keep))
+        lines = ["ffconcat version 1.0"]
+        for p, (_, a) in zip(slides, keep):
+            lines += [f"file '{p.name}'", f"duration {mp3_duration(a):.4f}"]
+        lines.append(f"file '{slides[-1].name}'")
+        Path(td, "list.txt").write_text("\n".join(lines), encoding="utf-8")
+        await asyncio.to_thread(run_ffmpeg, [
+            "-f", "concat", "-safe", "0", "-i", "list.txt", "-i", "audio.mp3",
+            "-vf", f"fps={VIDEO_FPS},format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage",
+            "-crf", str(VIDEO_CRF), "-g", str(VIDEO_FPS * 10), "-c:a", "aac", "-b:a", "48k", "-ac", "1",
+            "-shortest", "-movflags", "+faststart", "out.mp4"], td)
+        return Path(td, "out.mp4").read_bytes()
+
+
+async def join_videos(paths):
+    """Whole-topic video = the per-section videos stitched together (no re-encoding, nothing re-synthesized)."""
+    with tempfile.TemporaryDirectory() as td:
+        Path(td, "list.txt").write_text("\n".join(f"file '{Path(p).resolve().as_posix()}'" for p in paths), encoding="utf-8")
+        await asyncio.to_thread(run_ffmpeg, ["-f", "concat", "-safe", "0", "-i", "list.txt", "-c", "copy",
+                                             "-movflags", "+faststart", "out.mp4"], td)
+        return Path(td, "out.mp4").read_bytes()
+
+
+def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False, video=None):
     """fmts: {'mp3'|'md'|'pdf': 'section'|'file'|'both'} -> [Task]. Files sit side by side with the same base name."""
     tasks = []
 
@@ -421,15 +605,21 @@ def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False):
         elif ext == "md":
             async def run(ctx):
                 return render_md(title, secs, nested)
+        elif ext == "mp4":
+            async def run(ctx):
+                parts = [outdir / f"{s.name}.mp4" for s in secs]
+                if reuse and nested and all(p.exists() and p.stat().st_size > 0 for p in parts):
+                    return await join_videos(parts)
+                return await build_video(ctx, secs, title, video["voices"], video["base"], video, font)
         else:
             async def run(ctx):
                 return render_pdf(title, secs, nested, font)
-        return Task(path, run, ext, phase, skip_ok=(ext == "mp3"))
+        return Task(path, run, ext, phase, skip_ok=(ext in ("mp3", "mp4")))
 
     for g in groups:
-        for ext in ("mp3", "md", "pdf"):
+        for ext in ("mp3", "mp4", "md", "pdf"):
             gran = fmts.get(ext)
-            if not gran or not g.sections:
+            if not gran or not g.sections or (ext == "mp4" and not video):
                 continue
             want_sec, want_file = gran in ("section", "both"), gran in ("file", "both")
             if gran == "both" and len(g.sections) == 1:
@@ -438,15 +628,15 @@ def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False):
                 for s in g.sections:
                     tasks.append(mk(ext, outdir / f"{s.name}.{ext}", [s], g.title, False))
             if want_file:
-                reuse = ext == "mp3" and (want_sec or reuse_existing)
+                reuse = ext in ("mp3", "mp4") and (want_sec or reuse_existing)
                 tasks.append(mk(ext, outdir / f"{g.name}.{ext}", g.sections, g.title, True,
-                                phase=1 if ext == "mp3" else 0, reuse=reuse))
+                                phase=1 if ext in ("mp3", "mp4") else 0, reuse=reuse))
     return tasks
 
 
 def describe_tasks(tasks):
     n = Counter(t.kind for t in tasks)
-    return " · ".join(f"{n[k]} {lab}" for k, lab in (("mp3", "MP3"), ("md", "Markdown"), ("pdf", "PDF")) if n[k]) or "nothing"
+    return " · ".join(f"{n[k]} {lab}" for k, lab in (("mp3", "MP3"), ("mp4", "Video"), ("md", "Markdown"), ("pdf", "PDF")) if n[k]) or "nothing"
 
 
 async def run_tasks(tasks, parallel, skip_existing, on_progress):
@@ -598,7 +788,8 @@ def pdf_groups(pages, stem, title, mode, every):
             if len(grp) > 1:
                 blocks.append(("h", f"Page {n}"))
             blocks += [("p", p) for p in re.split(r"\n\s*\n", t) if p.strip()]
-        sections.append(Section(f"{stem}_{key}", ttl, blocks, ["\n\n".join(t for _, t in grp)]))
+        sections.append(Section(f"{stem}_{key}", ttl, blocks, ["\n\n".join(t for _, t in grp)],
+                                cards=text_cards([x[1] for x in blocks if x[0] == "p"])))
     key, _ = label(pages[0][0], pages[-1][0])
     return [Group(f"{stem}_{key}", title, sections)]
 
@@ -807,6 +998,21 @@ def doc_blocks(items, mode, o):
             or (mode.startswith("Persian") and l == "fa")]
 
 
+def bilingual_cards(its, mode, o):
+    """One card per drill card (English + Persian) or per line; same text/voices as the audio."""
+    if mode.startswith("Study drill"):
+        units = [([("en", c["en"])] + ([("fa", " ".join(c["fa"]))] if c["fa"] else [])) if c["en"]
+                 else [("fa", " ".join(c["fa"]))] for c in make_cards(its, o["max_fa"])]
+    else:
+        units = [[it] for it in its]
+    cards = []
+    for u in units:
+        toks, show = tokens_for(u, mode, o), doc_blocks(u, mode, o)
+        if toks and show:
+            cards.append(Card(show, toks))
+    return cards
+
+
 def bilingual_groups(items, mode, o, voices, base, announce, skip_fences):
     groups = []
     for name, text in items:
@@ -826,7 +1032,7 @@ def bilingual_groups(items, mode, o, voices, base, announce, skip_fences):
 
             i = len(sections) + 1
             sections.append(Section(name=f"{stem}/{i:03d}_{slug(title or 'section')}", title=title or f"Section {i}",
-                                    blocks=doc_blocks(its, mode, o), render=mk(toks)))
+                                    blocks=doc_blocks(its, mode, o), render=mk(toks), cards=bilingual_cards(its, mode, o)))
         if sections:
             groups.append(Group(stem, Path(name).stem, sections))
     return groups
@@ -865,7 +1071,7 @@ def export_panel(key, per_label="Per section", whole_label="Whole topic", allow_
     st.markdown("**What do you want to get?**")
     labels = {"section": per_label, "file": whole_label, "both": f"Both ({per_label.lower()} + {whole_label.lower()})"}
     out = {}
-    for col, ext in zip(st.columns(3), ("mp3", "md", "pdf")):
+    for col, ext in zip(st.columns(4), ("mp3", "mp4", "md", "pdf")):
         with col:
             if st.checkbox(FORMAT_LABELS[ext], value=(ext == "mp3"), key=f"{key}_{ext}_on"):
                 out[ext] = st.selectbox(f"{ext} granularity", list(labels), format_func=labels.get,
@@ -877,7 +1083,7 @@ def export_panel(key, per_label="Per section", whole_label="Whole topic", allow_
 
 def get_pdf_font(fmts, font_bytes):
     """None = PDF not requested, False = no usable font (error shown), else (regular, bold) paths."""
-    if "pdf" not in fmts:
+    if not ({"pdf", "mp4"} & set(fmts)):
         return None
     font = resolve_pdf_font(font_bytes)
     if font[0] is None:
@@ -885,6 +1091,37 @@ def get_pdf_font(fmts, font_bytes):
                  "next to tts_app.py (or connect to the internet once so they download), or upload a .ttf in the sidebar.")
         return False
     return font
+
+
+REPEAT_HELP = "How many times the slide's audio is played before the next slide appears."
+
+
+def video_setup(key, fmts, voices, base, default_repeats, repeat_help):
+    """Options for the slideshow video. None = not requested, False = tools missing (error shown), else dict."""
+    if "mp4" not in fmts:
+        return None
+    if not video_deps_ok():
+        st.error("Video export needs two small packages:  pip install imageio-ffmpeg pypdfium2   (or install ffmpeg yourself).")
+        return False
+    st.markdown("**🎬 Video options** — one slide per sentence; the slide stays until its audio has played N times.")
+    c1, c2, c3, c4 = st.columns(4)
+    repeats = c1.number_input("Plays per slide", 1, 20, default_repeats, key=f"{key}_v_rep", help=repeat_help)
+    gap = c2.number_input("Silence after each play (s)", 0.0, 10.0, 1.5, 0.5, key=f"{key}_v_gap",
+                          help="Time to repeat the sentence out loud (shadowing).")
+    size = c3.selectbox("Size", list(VIDEO_SIZES), index=1, key=f"{key}_v_size", help="Bigger = sharper text, slightly larger file.")
+    look = c4.selectbox("Look", ["Dark", "Light"], key=f"{key}_v_look")
+    return dict(repeats=int(repeats), gap=float(gap), size=VIDEO_SIZES[size], dark=look == "Dark",
+                voices=voices, base=base)
+
+
+def video_note(groups, vo):
+    n = sum(len(s.cards) for g in groups for s in g.sections)
+    return f" Video: {n} slides × {vo['repeats']} play(s) each." if vo else ""
+
+
+async def single_video(sec, vo, font):
+    ctx = {"sem": asyncio.Semaphore(3), "cache": {}}
+    return await build_video(ctx, [sec], sec.title, vo["voices"], vo["base"], vo, font)
 
 
 def doc_text(groups):
@@ -938,6 +1175,8 @@ def main():
         pitch = st.slider("Pitch (Hz)", -50, 50, 0, 5)
         volume = st.slider("Volume (%)", -50, 50, 0, 5)
         cfg = dict(voice=voice, rate=f"{round((speed - 1) * 100):+d}%", pitch=f"{pitch:+d}Hz", volume=f"{volume:+d}%")
+        vvoices = {"en": voice, "fa": voice}
+        vbase = dict(speed=speed, slow=-30, pitch=cfg["pitch"], volume=cfg["volume"])
 
         st.divider()
         sample = st.text_input("Preview text", "Hello! This is a preview of this voice.")
@@ -961,18 +1200,23 @@ def main():
         st.caption(f"{len(text):,} characters")
         title1 = st.text_input("Title (used for the file names and as the heading)", "Speech", key="single_title")
         fm1 = export_panel("single", allow_gran=False)
+        vo1 = video_setup("single", fm1, vvoices, vbase, 3, "How many times each sentence is played before the next slide.")
         font1 = get_pdf_font(fm1, font_bytes)
         if font1:
             warn_missing_glyphs(text, font1)
-        if st.button("Generate", type="primary", disabled=not text.strip() or not fm1 or font1 is False):
+        if st.button("Generate", type="primary", disabled=not text.strip() or not fm1 or font1 is False or vo1 is False):
             base_name = slug(title1, 40) if title1.strip() else "speech"
             sec = Section(base_name, title1.strip() or "Speech",
-                          [("p", p) for p in re.split(r"\n\s*\n", text.strip()) if p.strip()], [text])
+                          [("p", p) for p in re.split(r"\n\s*\n", text.strip()) if p.strip()], [text],
+                          cards=text_cards([p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]))
             files = {}
             try:
                 if "mp3" in fm1:
                     with st.spinner("Generating audio…"):
                         files[f"{base_name}.mp3"] = asyncio.run(synth(text, cfg))
+                if "mp4" in fm1:
+                    with st.spinner("Building the video…"):
+                        files[f"{base_name}.mp4"] = asyncio.run(single_video(sec, vo1, font1))
                 if "md" in fm1:
                     files[f"{base_name}.md"] = render_md(sec.title, [sec], False)
                 if "pdf" in fm1:
@@ -983,7 +1227,9 @@ def main():
         for fname, data in (st.session_state.get("single") or {}).items():
             if fname.endswith(".mp3"):
                 st.audio(data, format="audio/mp3")
-            mime = {"mp3": "audio/mpeg", "md": "text/markdown", "pdf": "application/pdf"}[fname.rsplit(".", 1)[1]]
+            elif fname.endswith(".mp4"):
+                st.video(data)
+            mime = {"mp3": "audio/mpeg", "mp4": "video/mp4", "md": "text/markdown", "pdf": "application/pdf"}[fname.rsplit(".", 1)[1]]
             st.download_button(f"⬇ Download {fname}", data, fname, mime, key=f"dl_single_{fname}")
 
     # ---------------- batch
@@ -1000,16 +1246,18 @@ def main():
         skip = d2.checkbox("Skip MP3 files already generated", True)
         only_fences = d3.checkbox("In .md files read only the ```text podcast blocks", True)
         fmts = export_panel("batch", "Per chapter", "Whole file")
+        vo = video_setup("batch", fmts, vvoices, vbase, 3, REPEAT_HELP)
         outdir = Path(st.text_input("Save files to folder", "tts_output"))
 
         font = get_pdf_font(fmts, font_bytes)
         items = read_sources(uploaded, folder)
         groups = make_groups(items, repeat, announce, only_fences) if items else []
-        tasks = plan_tasks(groups, outdir, fmts, cfg, font or None, skip) if groups and fmts and font is not False else []
+        tasks = plan_tasks(groups, outdir, fmts, cfg, font or None, skip, vo or None) \
+            if groups and fmts and font is not False and vo is not False else []
         if items:
             chars = sum(len(t) for g in groups for s in g.sections for t in s.texts)
             st.info(f"{len(items)} source file(s) → {sum(len(g.sections) for g in groups)} chapter(s), about {chars:,} characters. "
-                    f"Will create: {describe_tasks(tasks)}.")
+                    f"Will create: {describe_tasks(tasks)}.{video_note(groups, vo)}")
             if font:
                 warn_missing_glyphs(doc_text(groups), font)
 
@@ -1061,6 +1309,7 @@ def main():
                                  help="A 'part' is the unit that gets its own file when you choose 'Per part' below.")
                 every = m2.number_input("N (pages per part)", 1, 500, 5, disabled=pmode != PM_EVERY)
                 pfmts = export_panel("pdf", "Per part", "Whole range")
+                pvo = video_setup("pdf", pfmts, vvoices, vbase, 2, REPEAT_HELP)
                 pout = Path(st.text_input("Save files to folder", "tts_output", key="pdf_out"))
                 try:
                     wanted = parse_page_ranges(spec, total)
@@ -1082,9 +1331,10 @@ def main():
                         if pfont:
                             warn_missing_glyphs(full, pfont)
                         groups = pdf_groups(cleaned, slug(Path(pdf.name).stem, 40), Path(pdf.name).stem, pmode, every)
-                        tasks = plan_tasks(groups, pout, pfmts, cfg, pfont or None, False) if pfmts and pfont is not False else []
+                        tasks = plan_tasks(groups, pout, pfmts, cfg, pfont or None, False, pvo or None) \
+                            if pfmts and pfont is not False and pvo is not False else []
                         if tasks:
-                            st.caption(f"Will create: {describe_tasks(tasks)}.")
+                            st.caption(f"Will create: {describe_tasks(tasks)}.{video_note(groups, pvo)}")
                         if st.button("Generate", type="primary", key="pdf_go", disabled=not tasks):
                             bar = st.progress(0.0)
                             status = st.empty()
@@ -1157,6 +1407,9 @@ def main():
         skip_fences = f1.checkbox("Skip ```text podcast blocks (duplicates)", True)
         announce = f2.checkbox("Read chapter numbers aloud", True)
         bfmts = export_panel("bi", "Per chapter", "Whole file")
+        bvo = video_setup("bi", bfmts, voices_map, base, 1,
+                          "1 is usually right for the Study drill, which already repeats the English (see 'English repeats'). "
+                          "Raise it to replay the whole card (English → Persian → English).")
 
         parsed = [(n, bilingual_sections(n, t, skip_fences)) for n, t in b_items]
         all_items = [it for _, secs in parsed for _, its in secs for it in its]
@@ -1186,9 +1439,10 @@ def main():
         bpar = g2.slider("Parallel requests", 1, 6, 3, key="bi_par")
         bfont = get_pdf_font(bfmts, font_bytes)
         bgroups = bilingual_groups(b_items, bmode, o, voices_map, base, announce, skip_fences) if b_items else []
-        btasks = plan_tasks(bgroups, bout, bfmts, cfg, bfont or None, bskip) if bgroups and bfmts and bfont is not False else []
+        btasks = plan_tasks(bgroups, bout, bfmts, cfg, bfont or None, bskip, bvo or None) \
+            if bgroups and bfmts and bfont is not False and bvo is not False else []
         if bgroups:
-            st.caption(f"Will create: {describe_tasks(btasks)}.")
+            st.caption(f"Will create: {describe_tasks(btasks)}.{video_note(bgroups, bvo)}")
             if bfont:
                 warn_missing_glyphs(doc_text(bgroups), bfont)
         if st.button("Generate", type="primary", key="bi_go", disabled=not btasks):
