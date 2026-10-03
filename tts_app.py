@@ -15,14 +15,22 @@ Features
   * Batch tab: upload many .txt / .md files or a whole .zip (e.g. the `podcast/` folder),
     or point to a local folder. One MP3 per chapter or one MP3 per file. Everything is
     saved to a local folder and offered as one ZIP. Runs can be resumed (finished files are skipped).
+  * Every tab can export, per section (chapter / page part) and/or for the whole topic, any mix of:
+      MP3 audio, Markdown (.md) and PDF (Persian + English, right-to-left aware). Tick what you want.
+      Files with the same name sit side by side: 001_Chapter_1.mp3 / .md / .pdf
   * The app itself has no character, file-count or duration limit.
     (Only the online Microsoft service behind edge-tts can throttle you; the app retries automatically.)
 """
 import asyncio
+import hashlib
 import io
 import re
+import tempfile
+import urllib.request
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import edge_tts
@@ -114,7 +122,7 @@ async def synth(text, cfg, retries=5):
 
 # --------------------------------------------------------------------------- parsing sources
 def slug(s, n=60):
-    return re.sub(r"[^A-Za-z0-9]+", "_", s).strip("_")[:n] or "section"
+    return re.sub(r"[^\w]+", "_", s).strip("_")[:n] or "section"
 
 
 def sections_from_txt(text):
@@ -196,15 +204,43 @@ def build_text(title, lines, repeat, announce):
     return "\n\n".join(parts)
 
 
+# --------------------------------------------------------------------------- outputs model
+# Every source (txt/md file, PDF range, pasted text) becomes a Group (= the whole topic / file)
+# made of Sections (= chapters / page parts). A Section carries BOTH the text that is spoken and
+# the document blocks that mirror it, so MP3 / Markdown / PDF are always built from the same data.
+#   blocks: [("h", text) sub-heading | ("p", text) paragraph | ("qa", english, persian) pair]
 @dataclass
-class Job:
+class Section:
+    name: str                                    # output path inside the folder, without extension
+    title: str
+    blocks: list = field(default_factory=list)
+    texts: list = field(default_factory=list)    # plain texts for TTS (one voice)
+    render: object = None                        # async callable(ctx) -> mp3 bytes (bilingual tab)
+
+
+@dataclass
+class Group:
+    name: str
+    title: str
+    sections: list = field(default_factory=list)
+
+
+@dataclass
+class Task:
     path: Path
-    texts: list = field(default_factory=list)
-    render: object = None  # optional async callable(ctx) -> mp3 bytes (used by the bilingual tab)
+    run: object                                  # async callable(ctx) -> bytes
+    kind: str = "mp3"
+    phase: int = 0                               # phase 1 runs after phase 0 (merged MP3 re-uses chapter MP3s)
+    skip_ok: bool = False                        # may be skipped when the file already exists
 
 
-def make_jobs(items, outdir, mode, repeat, announce, only_fences):
-    jobs = []
+FORMAT_LABELS = {"mp3": "🔊 Audio (MP3)", "md": "📝 Markdown (.md)", "pdf": "📄 PDF"}
+GRAN = {"section": "Per section", "file": "Whole topic", "both": "Both"}
+
+
+def make_groups(items, repeat, announce, only_fences):
+    """Batch tab: .txt / .md sources -> [Group]. One section per chapter."""
+    groups = []
     for name, text in items:
         p = Path(name)
         stem = "__".join(p.with_suffix("").parts)
@@ -212,45 +248,235 @@ def make_jobs(items, outdir, mode, repeat, announce, only_fences):
         secs = [(t, l) for t, l in secs if l]
         if not secs:
             continue
-        texts = [(t, build_text(t, l, repeat, announce)) for t, l in secs]
-        if mode == "One MP3 per chapter":
-            for i, (t, body) in enumerate(texts, 1):
-                jobs.append(Job(outdir / stem / f"{i:03d}_{slug(t or 'section')}.mp3", [body]))
+        sections = [Section(name=f"{stem}/{i:03d}_{slug(t or 'section')}", title=t or f"Section {i}",
+                            blocks=[("p", ln) for ln in lines], texts=[build_text(t, lines, repeat, announce)])
+                    for i, (t, lines) in enumerate(secs, 1)]
+        groups.append(Group(stem, p.stem, sections))
+    return groups
+
+
+# ---- building the individual files
+def _md_line(t):
+    t = t.strip().replace("\n", "  \n")
+    return "\\" + t if t[:1] in "#>" else t
+
+
+def render_md(title, sections, nested):
+    """nested=True -> the whole topic ('# topic' / '## section'); False -> a single section file."""
+    out = []
+
+    def add(blocks, sub):
+        for b in blocks:
+            if b[0] == "h":
+                out.extend([f"{'#' * sub} {b[1]}", ""])
+            elif b[0] == "qa":
+                out.extend([_md_line(b[1]), "", "> " + _md_line(b[2]).replace("  \n", " "), ""])
+            else:
+                out.extend([_md_line(b[1]), ""])
+
+    if nested:
+        out.extend([f"# {title}", ""])
+        for s in sections:
+            out.extend([f"## {s.title}", ""])
+            add(s.blocks, 3)
+    else:
+        out.extend([f"# {sections[0].title}", ""])
+        add(sections[0].blocks, 2)
+    return ("\n".join(out).strip() + "\n").encode("utf-8")
+
+
+FONT_DIR = Path(__file__).resolve().parent / "fonts"
+FONT_URL = "https://raw.githubusercontent.com/rastikerdar/vazirmatn/master/fonts/ttf/{}"
+SYSTEM_FONTS = [  # (regular, bold) — used only if the bundled Vazirmatn is missing and cannot be downloaded
+    (r"C:\Windows\Fonts\tahoma.ttf", r"C:\Windows\Fonts\tahomabd.ttf"),
+    (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\arialbd.ttf"),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    ("/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf"),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+]
+
+
+def resolve_pdf_font(custom=None):
+    """-> (regular_path, bold_path) or (None, None). Order: uploaded font, fonts/Vazirmatn, download, system."""
+    if custom:
+        p = Path(tempfile.gettempdir()) / f"tts_app_font_{hashlib.md5(custom).hexdigest()[:10]}.ttf"
+        if not p.exists():
+            p.write_bytes(custom)
+        return p, p
+    reg, bold = FONT_DIR / "Vazirmatn-Regular.ttf", FONT_DIR / "Vazirmatn-Bold.ttf"
+    if not (reg.exists() and bold.exists()):
+        try:
+            FONT_DIR.mkdir(exist_ok=True)
+            for fp in (reg, bold):
+                if not fp.exists():
+                    with urllib.request.urlopen(FONT_URL.format(fp.name), timeout=20) as r:
+                        fp.write_bytes(r.read())
+        except Exception:  # noqa: BLE001
+            pass
+    if reg.exists():
+        return reg, (bold if bold.exists() else reg)
+    for r, b in SYSTEM_FONTS:
+        if Path(r).exists():
+            return Path(r), Path(b if Path(b).exists() else r)
+    return None, None
+
+
+@lru_cache(maxsize=8)
+def _cmap(path):
+    from fontTools.ttLib import TTFont
+    return set(TTFont(path, lazy=True).getBestCmap())
+
+
+def missing_glyphs(text, font_path):
+    """Characters of `text` that the PDF font cannot draw (they would show as empty boxes)."""
+    cm = _cmap(str(font_path))
+    return sorted({c for c in text if ord(c) > 32 and ord(c) not in cm and c not in "\u200c\u200d\u200e\u200f\ufeff"})
+
+
+def is_rtl(text):
+    return FA_CH.search(text) is not None and len(FA_CH.findall(text)) >= len(LAT_CH.findall(text))
+
+
+def render_pdf(title, sections, nested, font):
+    """Bilingual-safe PDF: Persian is shaped + right-to-left, English left-to-right, line by line."""
+    from fpdf import FPDF
+
+    reg, bold = font
+
+    class Doc(FPDF):
+        def footer(self):
+            ts = self.text_shaping
+            self.set_y(-13)
+            self.set_font("TTS", "", 9)
+            self.set_text_color(130, 130, 130)
+            self.set_text_shaping(True, direction="ltr")
+            self.cell(0, 8, str(self.page_no()), align="C")
+            self.text_shaping = ts
+
+    pdf = Doc(format="A4")
+    pdf.set_margins(18, 18, 18)
+    pdf.set_auto_page_break(True, 20)
+    pdf.add_font("TTS", "", str(reg))
+    pdf.add_font("TTS", "B", str(bold))
+    pdf.set_title(title)
+    pdf.set_creator("Unlimited Text to Speech")
+    pdf.add_page()
+
+    def para(text, size=12, style="", color=(0, 0, 0), gap=2.5, keep=0):
+        if keep and pdf.will_page_break(keep):
+            pdf.add_page()
+        for ln in text.split("\n"):
+            ln = ln.strip()
+            if not ln:
+                continue
+            rtl = is_rtl(ln)
+            pdf.set_text_shaping(True, direction="rtl" if rtl else "ltr")
+            pdf.set_font("TTS", style, size)
+            pdf.set_text_color(*color)
+            pdf.multi_cell(0, size * 0.62, ln, align="R" if rtl else "L", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(gap)
+
+    def add(blocks, sizes):
+        for b in blocks:
+            if b[0] == "h":
+                para(b[1], sizes, "B", (90, 90, 90), 1.5, keep=25)
+            elif b[0] == "qa":
+                para(b[1], 12.5, "", (0, 0, 0), 0.5, keep=22)
+                para(b[2], 12, "", (70, 70, 70), 3.5)
+            else:
+                para(b[1])
+
+    if nested:
+        para(title, 20, "B", gap=5)
+        for s in sections:
+            para(s.title, 15, "B", (30, 60, 130), 3, keep=35)
+            add(s.blocks, 12.5)
+    else:
+        para(sections[0].title, 20, "B", gap=5)
+        add(sections[0].blocks, 14)
+    return bytes(pdf.output())
+
+
+async def section_audio(ctx, secs, cfg, outdir, reuse):
+    """MP3 bytes for sections (concatenated). reuse=True picks up finished per-section MP3s from disk."""
+    async def one(s):
+        p = outdir / f"{s.name}.mp3"
+        if reuse and p.exists() and p.stat().st_size > 0:
+            return p.read_bytes()
+        if s.render:
+            return await s.render(ctx)
+        async with ctx["sem"]:
+            return b"".join([await synth(t, cfg) for t in s.texts])
+    return b"".join(await asyncio.gather(*[one(s) for s in secs]))
+
+
+def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False):
+    """fmts: {'mp3'|'md'|'pdf': 'section'|'file'|'both'} -> [Task]. Files sit side by side with the same base name."""
+    tasks = []
+
+    def mk(ext, path, secs, title, nested, phase=0, reuse=False):
+        if ext == "mp3":
+            async def run(ctx):
+                return await section_audio(ctx, secs, cfg, outdir, reuse)
+        elif ext == "md":
+            async def run(ctx):
+                return render_md(title, secs, nested)
         else:
-            jobs.append(Job(outdir / f"{stem}.mp3", [b for _, b in texts]))
-    return jobs
+            async def run(ctx):
+                return render_pdf(title, secs, nested, font)
+        return Task(path, run, ext, phase, skip_ok=(ext == "mp3"))
+
+    for g in groups:
+        for ext in ("mp3", "md", "pdf"):
+            gran = fmts.get(ext)
+            if not gran or not g.sections:
+                continue
+            want_sec, want_file = gran in ("section", "both"), gran in ("file", "both")
+            if gran == "both" and len(g.sections) == 1:
+                want_sec = False                       # a single section: both files would be identical
+            if want_sec:
+                for s in g.sections:
+                    tasks.append(mk(ext, outdir / f"{s.name}.{ext}", [s], g.title, False))
+            if want_file:
+                reuse = ext == "mp3" and (want_sec or reuse_existing)
+                tasks.append(mk(ext, outdir / f"{g.name}.{ext}", g.sections, g.title, True,
+                                phase=1 if ext == "mp3" else 0, reuse=reuse))
+    return tasks
 
 
-async def run_batch(jobs, cfg, parallel, skip_existing, on_progress):
-    sem = asyncio.Semaphore(parallel)
-    piece_sem = asyncio.Semaphore(parallel)
+def describe_tasks(tasks):
+    n = Counter(t.kind for t in tasks)
+    return " · ".join(f"{n[k]} {lab}" for k, lab in (("mp3", "MP3"), ("md", "Markdown"), ("pdf", "PDF")) if n[k]) or "nothing"
+
+
+async def run_tasks(tasks, parallel, skip_existing, on_progress):
+    sem = asyncio.Semaphore(parallel)           # how many files are built at once
+    piece_sem = asyncio.Semaphore(parallel)     # how many requests to the speech service are in flight
     results = {"done": 0, "skipped": 0, "failed": []}
 
-    async def work(job):
+    async def work(t):
         async with sem:
-            if skip_existing and job.path.exists() and job.path.stat().st_size > 0:
-                return job, "skipped", None
+            if t.skip_ok and skip_existing and t.path.exists() and t.path.stat().st_size > 0:
+                return t, "skipped", None
             try:
-                if job.render:
-                    audio = await job.render({"sem": piece_sem, "cache": {}})
-                else:
-                    audio = b"".join([await synth(t, cfg) for t in job.texts])
-                job.path.parent.mkdir(parents=True, exist_ok=True)
-                job.path.write_bytes(audio)
-                return job, "done", None
+                data = await t.run({"sem": piece_sem, "cache": {}})
+                t.path.parent.mkdir(parents=True, exist_ok=True)
+                t.path.write_bytes(data)
+                return t, "done", None
             except Exception as e:  # noqa: BLE001
-                return job, "failed", str(e)
+                return t, "failed", str(e)
 
-    tasks = [asyncio.create_task(work(j)) for j in jobs]
     finished = 0
-    for fut in asyncio.as_completed(tasks):
-        job, status, err = await fut
-        finished += 1
-        if status == "failed":
-            results["failed"].append((str(job.path), err))
-        else:
-            results[status] += 1
-        on_progress(finished, len(jobs), job.path.name, status)
+    for phase in sorted({t.phase for t in tasks}):
+        pending = [asyncio.create_task(work(t)) for t in tasks if t.phase == phase]
+        for fut in asyncio.as_completed(pending):
+            t, status, err = await fut
+            finished += 1
+            if status == "failed":
+                results["failed"].append((str(t.path), err))
+            else:
+                results[status] += 1
+            on_progress(finished, len(tasks), t.path.name, status)
     return results
 
 
@@ -350,20 +576,31 @@ def clean_pdf_pages(pages, rm_headers=True, rm_pagenums=True, skip_foreign=False
     return out
 
 
-def pdf_jobs(pages, stem, outdir, mode, every):
+PM_WHOLE, PM_PAGE, PM_EVERY = "Whole range as one part", "One part per page", "One part every N pages"
+
+
+def pdf_groups(pages, stem, title, mode, every):
+    """Cleaned PDF pages -> [Group]. Parts (= sections) are single pages, N pages, or the whole range."""
     pages = [(n, t) for n, t in pages if t.strip()]
     if not pages:
         return []
-    if mode == "One MP3 per page":
-        return [Job(outdir / f"{stem}_page_{n:03d}.mp3", [t]) for n, t in pages]
-    step = len(pages) if mode == "One MP3 for the whole range" else max(1, int(every))
-    jobs = []
+    step = len(pages) if mode == PM_WHOLE else 1 if mode == PM_PAGE else max(1, int(every))
+
+    def label(a, b):
+        return (f"page_{a:03d}", f"Page {a}") if a == b else (f"pages_{a:03d}-{b:03d}", f"Pages {a}\u2013{b}")
+
+    sections = []
     for i in range(0, len(pages), step):
         grp = pages[i:i + step]
-        a, b = grp[0][0], grp[-1][0]
-        name = f"{stem}_page_{a:03d}.mp3" if a == b else f"{stem}_pages_{a:03d}-{b:03d}.mp3"
-        jobs.append(Job(outdir / name, ["\n\n".join(t for _, t in grp)]))
-    return jobs
+        key, ttl = label(grp[0][0], grp[-1][0])
+        blocks = []
+        for n, t in grp:
+            if len(grp) > 1:
+                blocks.append(("h", f"Page {n}"))
+            blocks += [("p", p) for p in re.split(r"\n\s*\n", t) if p.strip()]
+        sections.append(Section(f"{stem}_{key}", ttl, blocks, ["\n\n".join(t for _, t in grp)]))
+    key, _ = label(pages[0][0], pages[-1][0])
+    return [Group(f"{stem}_{key}", title, sections)]
 
 
 # --------------------------------------------------------------------------- BILINGUAL
@@ -556,33 +793,43 @@ async def render_tokens(toks, ctx, voices, base):
     return bytes(out)
 
 
-def bilingual_jobs(items, outdir, per_chapter, mode, o, voices, base, announce, skip_fences):
-    jobs = []
+def doc_blocks(items, mode, o):
+    """Blocks for the .md / .pdf of a bilingual section: the same text the audio reads (without repeats)."""
+    if mode.startswith("Study drill"):
+        out = []
+        for c in make_cards(items, o["max_fa"]):
+            if c["en"]:
+                out.append(("qa", c["en"], " ".join(c["fa"])) if (o["read_fa"] and c["fa"]) else ("p", c["en"]))
+            elif o["read_expl"]:
+                out.append(("p", " ".join(c["fa"])))
+        return out
+    return [("p", t) for l, t in items if mode.startswith("Both") or (mode.startswith("English") and l == "en")
+            or (mode.startswith("Persian") and l == "fa")]
+
+
+def bilingual_groups(items, mode, o, voices, base, announce, skip_fences):
+    groups = []
     for name, text in items:
         stem = "__".join(Path(name).with_suffix("").parts)
-        secs = bilingual_sections(name, text, skip_fences)
-        if not secs:
-            continue
-        toks_list = []
-        for title, its in secs:
+        sections = []
+        for title, its in bilingual_sections(name, text, skip_fences):
             toks = tokens_for(its, mode, o)
-            if announce and title and toks:
+            if not toks:
+                continue
+            if announce and title:
                 toks = [("say", "en", title + ".", False), ("pause", 0.5)] + toks
-            if toks:
-                toks_list.append((title, toks))
 
-        def mk(toks):
-            async def render(ctx):
-                return await render_tokens(toks, ctx, voices, base)
-            return render
+            def mk(toks):
+                async def render(ctx):
+                    return await render_tokens(toks, ctx, voices, base)
+                return render
 
-        if per_chapter:
-            for i, (title, toks) in enumerate(toks_list, 1):
-                jobs.append(Job(outdir / stem / f"{i:03d}_{slug(title or 'section')}.mp3", [], mk(toks)))
-        elif toks_list:
-            allt = [t for _, ts in toks_list for t in ts]
-            jobs.append(Job(outdir / f"{stem}.mp3", [], mk(allt)))
-    return jobs
+            i = len(sections) + 1
+            sections.append(Section(name=f"{stem}/{i:03d}_{slug(title or 'section')}", title=title or f"Section {i}",
+                                    blocks=doc_blocks(its, mode, o), render=mk(toks)))
+        if sections:
+            groups.append(Group(stem, Path(name).stem, sections))
+    return groups
 
 
 @st.cache_data(show_spinner=False, max_entries=500)
@@ -611,6 +858,55 @@ async def _preview_many(shorts, text, cfg, parallel, on_progress):
 
 def use_voice(label):
     st.session_state["voice_label"] = label
+
+
+def export_panel(key, per_label="Per section", whole_label="Whole topic", allow_gran=True):
+    """Tick-boxes for MP3 / Markdown / PDF, each with its own granularity -> {'mp3': 'section'|'file'|'both', ...}"""
+    st.markdown("**What do you want to get?**")
+    labels = {"section": per_label, "file": whole_label, "both": f"Both ({per_label.lower()} + {whole_label.lower()})"}
+    out = {}
+    for col, ext in zip(st.columns(3), ("mp3", "md", "pdf")):
+        with col:
+            if st.checkbox(FORMAT_LABELS[ext], value=(ext == "mp3"), key=f"{key}_{ext}_on"):
+                out[ext] = st.selectbox(f"{ext} granularity", list(labels), format_func=labels.get,
+                                        key=f"{key}_{ext}_gran", label_visibility="collapsed") if allow_gran else "section"
+    if not out:
+        st.warning("Tick at least one output.")
+    return out
+
+
+def get_pdf_font(fmts, font_bytes):
+    """None = PDF not requested, False = no usable font (error shown), else (regular, bold) paths."""
+    if "pdf" not in fmts:
+        return None
+    font = resolve_pdf_font(font_bytes)
+    if font[0] is None:
+        st.error("No font available for the PDF. Put Vazirmatn-Regular.ttf and Vazirmatn-Bold.ttf in a `fonts/` folder "
+                 "next to tts_app.py (or connect to the internet once so they download), or upload a .ttf in the sidebar.")
+        return False
+    return font
+
+
+def doc_text(groups):
+    return "\n".join(x for g in groups for s in g.sections for b in s.blocks for x in b[1:])
+
+
+def warn_missing_glyphs(text, font):
+    miss = missing_glyphs(text, font[0]) if font and text else []
+    if miss:
+        st.warning("The PDF font cannot draw these characters (they would appear as empty boxes): "
+                   + " ".join(miss[:25]) + (" …" if len(miss) > 25 else "")
+                   + "  — upload a font that supports your language in the sidebar (📄 PDF font).")
+
+
+def show_results(res, tasks, outdir):
+    st.success(f"Done: {res['done']} generated, {res['skipped']} skipped, {len(res['failed'])} failed. "
+               f"Saved in: {outdir.resolve()}")
+    if res["failed"]:
+        with st.expander("Failed files (press Generate again to retry only the missing MP3s)"):
+            for p, e in res["failed"]:
+                st.write(f"`{p}` — {e}")
+    return [(t.path, outdir) for t in tasks if t.path.exists()]
 
 
 # --------------------------------------------------------------------------- UI
@@ -651,21 +947,44 @@ def main():
             except Exception as e:  # noqa: BLE001
                 st.error(f"Preview failed: {e}")
 
+        with st.expander("📄 PDF font"):
+            font_up = st.file_uploader("Custom font (.ttf) — optional", type=["ttf"], key="pdf_font_up")
+            st.caption("Default: Vazirmatn (Persian + English) from the `fonts/` folder. "
+                       "Upload another .ttf if your text uses other scripts (Chinese, Cyrillic, …).")
+        font_bytes = font_up.getvalue() if font_up else None
+
     tab1, tab2, tab_pdf, tab_bi, tab3 = st.tabs(["✍️ Single text", "📚 Batch files", "📄 PDF", "🌐 Bilingual", "🎙 Voice gallery"])
 
     # ---------------- single text
     with tab1:
         text = st.text_area("Text", height=320, placeholder="Enter text here… (any length)")
         st.caption(f"{len(text):,} characters")
-        if st.button("Generate audio", type="primary", disabled=not text.strip()):
-            with st.spinner("Generating…"):
-                try:
-                    st.session_state["single"] = asyncio.run(synth(text, cfg))
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"Failed: {e}")
-        if st.session_state.get("single"):
-            st.audio(st.session_state["single"], format="audio/mp3")
-            st.download_button("⬇ Download MP3", st.session_state["single"], "speech.mp3", "audio/mpeg")
+        title1 = st.text_input("Title (used for the file names and as the heading)", "Speech", key="single_title")
+        fm1 = export_panel("single", allow_gran=False)
+        font1 = get_pdf_font(fm1, font_bytes)
+        if font1:
+            warn_missing_glyphs(text, font1)
+        if st.button("Generate", type="primary", disabled=not text.strip() or not fm1 or font1 is False):
+            base_name = slug(title1, 40) if title1.strip() else "speech"
+            sec = Section(base_name, title1.strip() or "Speech",
+                          [("p", p) for p in re.split(r"\n\s*\n", text.strip()) if p.strip()], [text])
+            files = {}
+            try:
+                if "mp3" in fm1:
+                    with st.spinner("Generating audio…"):
+                        files[f"{base_name}.mp3"] = asyncio.run(synth(text, cfg))
+                if "md" in fm1:
+                    files[f"{base_name}.md"] = render_md(sec.title, [sec], False)
+                if "pdf" in fm1:
+                    files[f"{base_name}.pdf"] = render_pdf(sec.title, [sec], False, font1)
+                st.session_state["single"] = files
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Failed: {e}")
+        for fname, data in (st.session_state.get("single") or {}).items():
+            if fname.endswith(".mp3"):
+                st.audio(data, format="audio/mp3")
+            mime = {"mp3": "audio/mpeg", "md": "text/markdown", "pdf": "application/pdf"}[fname.rsplit(".", 1)[1]]
+            st.download_button(f"⬇ Download {fname}", data, fname, mime, key=f"dl_single_{fname}")
 
     # ---------------- batch
     with tab2:
@@ -673,50 +992,48 @@ def main():
                  "or type a local folder path.")
         uploaded = st.file_uploader("Files", type=["txt", "md", "zip"], accept_multiple_files=True)
         folder = st.text_input("…or a local folder path (optional)", placeholder=r"C:\English-for-Shopping-Markdown\podcast")
-        c1, c2, c3 = st.columns(3)
-        mode = c1.radio("Output", ["One MP3 per chapter", "One MP3 per file (chapters merged)"])
-        repeat = c2.number_input("Read each sentence N times", 1, 5, 1, help="Handy for shadowing practice.")
+        c2, c3 = st.columns(2)
+        repeat = c2.number_input("Read each sentence N times", 1, 5, 1, help="Handy for shadowing practice (audio only).")
         parallel = c3.slider("Parallel requests", 1, 6, 3, help="Higher is faster but more likely to be throttled.")
         d1, d2, d3 = st.columns(3)
         announce = d1.checkbox("Read chapter titles aloud", True)
-        skip = d2.checkbox("Skip files already generated", True)
+        skip = d2.checkbox("Skip MP3 files already generated", True)
         only_fences = d3.checkbox("In .md files read only the ```text podcast blocks", True)
-        outdir = Path(st.text_input("Save MP3 files to folder", "tts_output"))
+        fmts = export_panel("batch", "Per chapter", "Whole file")
+        outdir = Path(st.text_input("Save files to folder", "tts_output"))
 
+        font = get_pdf_font(fmts, font_bytes)
         items = read_sources(uploaded, folder)
-        jobs = make_jobs(items, outdir, mode, repeat, announce, only_fences) if items else []
+        groups = make_groups(items, repeat, announce, only_fences) if items else []
+        tasks = plan_tasks(groups, outdir, fmts, cfg, font or None, skip) if groups and fmts and font is not False else []
         if items:
-            chars = sum(len(t) for j in jobs for t in j.texts)
-            st.info(f"{len(items)} source file(s) → {len(jobs)} MP3 file(s), about {chars:,} characters.")
+            chars = sum(len(t) for g in groups for s in g.sections for t in s.texts)
+            st.info(f"{len(items)} source file(s) → {sum(len(g.sections) for g in groups)} chapter(s), about {chars:,} characters. "
+                    f"Will create: {describe_tasks(tasks)}.")
+            if font:
+                warn_missing_glyphs(doc_text(groups), font)
 
-        if st.button("Generate all", type="primary", disabled=not jobs):
+        if st.button("Generate all", type="primary", disabled=not tasks):
             bar = st.progress(0.0)
             status = st.empty()
-            log = st.container()
 
             def on_progress(done, total, name, st_):
                 bar.progress(done / total)
                 status.write(f"{done}/{total} — {name} ({st_})")
 
-            res = asyncio.run(run_batch(jobs, cfg, parallel, skip, on_progress))
+            res = asyncio.run(run_tasks(tasks, parallel, skip, on_progress))
             bar.progress(1.0)
-            ok = [(j.path, outdir) for j in jobs if j.path.exists()]
-            st.success(f"Done: {res['done']} generated, {res['skipped']} skipped, {len(res['failed'])} failed. "
-                       f"Saved in: {outdir.resolve()}")
-            if res["failed"]:
-                with log.expander("Failed files (press Generate all again to retry only these)"):
-                    for p, e in res["failed"]:
-                        st.write(f"`{p}` — {e}")
-            if ok:
-                st.session_state["zip"] = zip_folder(ok)
+            ok = show_results(res, tasks, outdir)
+            st.session_state["zip"] = zip_folder(ok) if ok else None
 
         if st.session_state.get("zip"):
-            st.download_button("⬇ Download everything as ZIP", st.session_state["zip"], "tts_audio.zip", "application/zip")
+            st.download_button("⬇ Download everything as ZIP", st.session_state["zip"], "tts_output.zip", "application/zip")
 
     # ---------------- PDF
     with tab_pdf:
-        st.write("Upload a PDF, choose the pages, and get audio. Works with PDFs that contain real text "
-                 "(scanned images need OCR first). Use a voice that matches the language of the text.")
+        st.write("Upload a PDF, choose the pages, and get audio, Markdown and/or a new clean PDF of the text. "
+                 "Works with PDFs that contain real text (scanned images need OCR first). "
+                 "Use a voice that matches the language of the text.")
         try:
             import pypdf  # noqa: F401
             have_pypdf = True
@@ -738,11 +1055,13 @@ def main():
                 rm_head = o1.checkbox("Remove repeated headers/footers", True)
                 rm_num = o2.checkbox("Remove page numbers", True)
                 skip_foreign = o3.checkbox("Skip Persian/Arabic/other non-Latin lines", False,
-                                           help="Handy for bilingual PDFs: only the English lines are read.")
+                                           help="Handy for bilingual PDFs: only the English lines are used.")
                 m1, m2 = st.columns(2)
-                pmode = m1.radio("Output", ["One MP3 for the whole range", "One MP3 per page", "One MP3 every N pages"])
-                every = m2.number_input("N (pages per MP3)", 1, 500, 5, disabled=pmode != "One MP3 every N pages")
-                pout = Path(st.text_input("Save MP3 files to folder", "tts_output", key="pdf_out"))
+                pmode = m1.radio("Split the range into parts", [PM_WHOLE, PM_PAGE, PM_EVERY],
+                                 help="A 'part' is the unit that gets its own file when you choose 'Per part' below.")
+                every = m2.number_input("N (pages per part)", 1, 500, 5, disabled=pmode != PM_EVERY)
+                pfmts = export_panel("pdf", "Per part", "Whole range")
+                pout = Path(st.text_input("Save files to folder", "tts_output", key="pdf_out"))
                 try:
                     wanted = parse_page_ranges(spec, total)
                 except ValueError as e:
@@ -759,9 +1078,14 @@ def main():
                         st.info(f"{len(wanted)} page(s) selected · {len(full):,} characters · roughly {minutes:.0f} min of audio")
                         with st.expander("Preview extracted text"):
                             st.text(full[:6000] + ("\n…" if len(full) > 6000 else ""))
-                        if st.button("Generate PDF audio", type="primary"):
-                            stem = slug(Path(pdf.name).stem, 40)
-                            jobs = pdf_jobs(cleaned, stem, pout, pmode, every)
+                        pfont = get_pdf_font(pfmts, font_bytes)
+                        if pfont:
+                            warn_missing_glyphs(full, pfont)
+                        groups = pdf_groups(cleaned, slug(Path(pdf.name).stem, 40), Path(pdf.name).stem, pmode, every)
+                        tasks = plan_tasks(groups, pout, pfmts, cfg, pfont or None, False) if pfmts and pfont is not False else []
+                        if tasks:
+                            st.caption(f"Will create: {describe_tasks(tasks)}.")
+                        if st.button("Generate", type="primary", key="pdf_go", disabled=not tasks):
                             bar = st.progress(0.0)
                             status = st.empty()
 
@@ -770,18 +1094,14 @@ def main():
                                 status.write(f"{done}/{total_} — {name} ({st_})")
 
                             with st.spinner("Generating… long ranges can take a while"):
-                                res = asyncio.run(run_batch(jobs, cfg, 3, False, on_prog))
+                                res = asyncio.run(run_tasks(tasks, 3, False, on_prog))
                             bar.progress(1.0)
-                            st.success(f"Done: {res['done']} file(s) generated, {len(res['failed'])} failed. "
-                                       f"Saved in: {pout.resolve()}")
-                            for pth, err in res["failed"]:
-                                st.error(f"`{pth}` — {err}")
-                            okf = [(j.path, pout) for j in jobs if j.path.exists()]
+                            okf = show_results(res, tasks, pout)
                             st.session_state["pdf_zip"] = zip_folder(okf) if okf else None
-                            if len(okf) == 1:
+                            if len(okf) == 1 and okf[0][0].suffix == ".mp3":
                                 st.audio(okf[0][0].read_bytes(), format="audio/mp3")
         if st.session_state.get("pdf_zip"):
-            st.download_button("⬇ Download PDF audio as ZIP", st.session_state["pdf_zip"], "pdf_audio.zip", "application/zip")
+            st.download_button("⬇ Download PDF-tab output as ZIP", st.session_state["pdf_zip"], "pdf_output.zip", "application/zip")
 
     # ---------------- bilingual
     with tab_bi:
@@ -833,10 +1153,10 @@ def main():
             up = st.file_uploader("Files", type=["txt", "md", "zip"], accept_multiple_files=True, key="bi_files")
             fold = st.text_input("…or a local folder path (optional)", key="bi_folder", placeholder=r"C:\English-for-Shopping-Markdown\parts")
             b_items = read_sources(up, fold)
-        f1, f2, f3 = st.columns(3)
+        f1, f2 = st.columns(2)
         skip_fences = f1.checkbox("Skip ```text podcast blocks (duplicates)", True)
         announce = f2.checkbox("Read chapter numbers aloud", True)
-        per_chapter = f3.radio("Output", ["One MP3 per chapter", "One MP3 per file"], horizontal=True) == "One MP3 per chapter"
+        bfmts = export_panel("bi", "Per chapter", "Whole file")
 
         parsed = [(n, bilingual_sections(n, t, skip_fences)) for n, t in b_items]
         all_items = [it for _, secs in parsed for _, its in secs for it in its]
@@ -860,14 +1180,18 @@ def main():
             if st.session_state.get("bi_try"):
                 st.audio(st.session_state["bi_try"], format="audio/mp3")
 
-        bout = Path(st.text_input("Save MP3 files to folder", "tts_output", key="bi_out"))
+        bout = Path(st.text_input("Save files to folder", "tts_output", key="bi_out"))
         g1, g2 = st.columns(2)
-        bskip = g1.checkbox("Skip files already generated", True, key="bi_skip")
+        bskip = g1.checkbox("Skip MP3 files already generated", True, key="bi_skip")
         bpar = g2.slider("Parallel requests", 1, 6, 3, key="bi_par")
-        bjobs = bilingual_jobs(b_items, bout, per_chapter, bmode, o, voices_map, base, announce, skip_fences) if b_items else []
-        if bjobs:
-            st.caption(f"{len(bjobs)} MP3 file(s) will be created.")
-        if st.button("Generate bilingual audio", type="primary", disabled=not bjobs):
+        bfont = get_pdf_font(bfmts, font_bytes)
+        bgroups = bilingual_groups(b_items, bmode, o, voices_map, base, announce, skip_fences) if b_items else []
+        btasks = plan_tasks(bgroups, bout, bfmts, cfg, bfont or None, bskip) if bgroups and bfmts and bfont is not False else []
+        if bgroups:
+            st.caption(f"Will create: {describe_tasks(btasks)}.")
+            if bfont:
+                warn_missing_glyphs(doc_text(bgroups), bfont)
+        if st.button("Generate", type="primary", key="bi_go", disabled=not btasks):
             bar = st.progress(0.0)
             status = st.empty()
 
@@ -876,16 +1200,12 @@ def main():
                 status.write(f"{done}/{total_} — {name} ({st_})")
 
             with st.spinner("Generating… drills need several requests per line, so this takes longer"):
-                res = asyncio.run(run_batch(bjobs, cfg, bpar, bskip, on_bi))
+                res = asyncio.run(run_tasks(btasks, bpar, bskip, on_bi))
             bar.progress(1.0)
-            st.success(f"Done: {res['done']} generated, {res['skipped']} skipped, {len(res['failed'])} failed. "
-                       f"Saved in: {bout.resolve()}")
-            for pth, err in res["failed"]:
-                st.error(f"`{pth}` — {err}")
-            okf = [(j.path, bout) for j in bjobs if j.path.exists()]
+            okf = show_results(res, btasks, bout)
             st.session_state["bi_zip"] = zip_folder(okf) if okf else None
         if st.session_state.get("bi_zip"):
-            st.download_button("⬇ Download bilingual audio as ZIP", st.session_state["bi_zip"], "bilingual_audio.zip", "application/zip")
+            st.download_button("⬇ Download bilingual output as ZIP", st.session_state["bi_zip"], "bilingual_output.zip", "application/zip")
 
     # ---------------- voice gallery
     with tab3:
