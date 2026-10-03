@@ -648,10 +648,10 @@ def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False, book_
                 return await section_audio(ctx, secs, cfg, outdir, reuse)
         elif ext == "md":
             async def run(ctx):
-                return render_md(title, secs, nested)
+                return await asyncio.to_thread(render_md, title, secs, nested)
         else:
             async def run(ctx):
-                return render_pdf(title, secs, nested, font)
+                return await asyncio.to_thread(render_pdf, title, secs, nested, font)
         return Task(path, run, ext, phase, skip_ok=(ext == "mp3"))
 
     for g in groups:
@@ -673,8 +673,9 @@ def plan_tasks(groups, outdir, fmts, cfg, font=None, reuse_existing=False, book_
 
     def mk_book(ext, path):
         async def run(ctx):
-            return (render_md(book_title, None, True, book=groups) if ext == "md"
-                    else render_pdf(book_title, None, True, font, book=groups))
+            if ext == "md":
+                return await asyncio.to_thread(render_md, book_title, None, True, groups)
+            return await asyncio.to_thread(render_pdf, book_title, None, True, font, groups)
         return Task(path, run, ext)
 
     for ext in ("md", "pdf"):
@@ -691,10 +692,11 @@ def describe_tasks(tasks):
 async def run_tasks(tasks, parallel, skip_existing, on_progress):
     sem = asyncio.Semaphore(parallel)           # how many files are built at once
     piece_sem = asyncio.Semaphore(parallel)     # how many requests to the speech service are in flight
+    doc_sem = asyncio.Semaphore(2)              # md / pdf building: separate pool, runs alongside the audio
     results = {"done": 0, "skipped": 0, "failed": []}
 
     async def work(t):
-        async with sem:
+        async with (sem if t.kind == "mp3" else doc_sem):
             if t.skip_ok and skip_existing and t.path.exists() and t.path.stat().st_size > 0:
                 return t, "skipped", None
             try:
