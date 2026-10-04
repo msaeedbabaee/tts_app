@@ -7,8 +7,9 @@ Install & run:
 
 Features
   * Any language / gender / voice that edge-tts offers, speed / pitch / volume
-  * Bilingual tab: English lines read by an English voice, Persian lines by a Persian voice, plus a
-    study drill (English -> pause -> Persian -> English again, slower) for shadowing practice
+  * Bilingual tab: choose the language you learn (English, French, German, Spanish, Italian): its lines are read by
+    that language's voice, Persian lines by a Persian voice, plus a study drill (foreign -> pause -> Persian ->
+    foreign again, slower) for shadowing practice
   * PDF tab: upload a PDF, choose pages (e.g. 1-5, 8, 10-12), get one MP3 for the range / per page / every N pages
   * Voice gallery: listen to every voice of a language side by side, then pick one with a click
   * Single text tab: paste any amount of text (it is split into safe chunks automatically)
@@ -49,7 +50,30 @@ FALLBACK_VOICES = [
     ("en-GB-RyanNeural", "Male", "en-GB", "English", "United Kingdom"),
     ("fa-IR-DilaraNeural", "Female", "fa-IR", "Persian", "Iran"),
     ("fa-IR-FaridNeural", "Male", "fa-IR", "Persian", "Iran"),
+    ("fr-FR-DeniseNeural", "Female", "fr-FR", "French", "France"),
+    ("fr-FR-HenriNeural", "Male", "fr-FR", "French", "France"),
+    ("fr-FR-EloiseNeural", "Female", "fr-FR", "French", "France"),
+    ("fr-CA-SylvieNeural", "Female", "fr-CA", "French", "Canada"),
+    ("fr-CA-JeanNeural", "Male", "fr-CA", "French", "Canada"),
+    ("de-DE-KatjaNeural", "Female", "de-DE", "German", "Germany"),
+    ("de-DE-ConradNeural", "Male", "de-DE", "German", "Germany"),
+    ("es-ES-ElviraNeural", "Female", "es-ES", "Spanish", "Spain"),
+    ("es-ES-AlvaroNeural", "Male", "es-ES", "Spanish", "Spain"),
+    ("it-IT-ElsaNeural", "Female", "it-IT", "Italian", "Italy"),
+    ("it-IT-DiegoNeural", "Male", "it-IT", "Italian", "Italy"),
 ]
+
+# language you can learn in the Bilingual tab (all Latin script, paired with Persian):
+# name -> (locale prefix, word for 'Chapter', default voice, example line)
+LEARN_LANGS = {
+    "English": ("en", "Chapter", "en-US-AriaNeural", "Where is the bread?"),
+    "French": ("fr", "Chapitre", "fr-FR-DeniseNeural", "Où est le pain ?"),
+    "German": ("de", "Kapitel", "de-DE-KatjaNeural", "Wo ist das Brot?"),
+    "Spanish": ("es", "Capítulo", "es-ES-ElviraNeural", "¿Dónde está el pan?"),
+    "Italian": ("it", "Capitolo", "it-IT-ElsaNeural", "Dov'è il pane?"),
+}
+LANG_HEADERS = {"english", "french", "français", "francais", "german", "deutsch", "spanish", "español", "espanol",
+                "italian", "italiano"}
 
 
 # --------------------------------------------------------------------------- voices
@@ -128,12 +152,15 @@ def slug(s, n=60):
     return re.sub(r"[^\w]+", "_", s).strip("_")[:n] or "section"
 
 
+TXT_CHAPTER_RE = re.compile(r"^(Chapter|Topic|Chapitre|Leçon|Lecon|Unité|Unite|Kapitel|Capítulo|Capitolo|Lección|Lezione)\s+\d")
+
+
 def sections_from_txt(text):
     """[(title, [lines])] — splits at lines like 'Chapter 1.2 — …' / 'Topic 3 — …'."""
     secs, title, lines, seen = [], None, [], False
     for raw in text.splitlines():
         line = raw.strip()
-        if re.match(r"^(Chapter|Topic)\s+\d", line):
+        if TXT_CHAPTER_RE.match(line):
             if lines:
                 secs.append((title, lines))
             title, lines, seen = line.replace(" — ", ". "), [], True
@@ -885,7 +912,7 @@ def pdf_groups(pages, stem, title, mode, every):
 # --------------------------------------------------------------------------- BILINGUAL
 EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D\u20E3]")
 FA_CH = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
-LAT_CH = re.compile(r"[A-Za-z]")
+LAT_CH = re.compile(r"[A-Za-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0152\u0153\u0160\u0161\u0178\u017D\u017E]")
 SKIP_TOKEN = re.compile(r"[—–→↔=|•·]+")
 
 
@@ -958,11 +985,14 @@ def bilingual_sections(name, text, skip_fences=True):
         if m:
             flush(); title = f"Chapter {m.group(1)}"; started = True
             continue
+        if not is_md and TXT_CHAPTER_RE.match(line.strip()):      # .txt: 'Chapitre 2.1 — Au café' starts a chapter
+            flush(); title = line.strip().replace(" — ", ". "); started = True
+            continue
         if not started or "English for Podcast" in line or re.match(r"^\s*(-{3,}|\*{3,}|_{3,})\s*$", line):
             continue
         if line.strip().startswith("|"):
             cells = [c.strip() for c in line.strip().strip("|").split("|")]
-            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c) or [c.lower() for c in cells] == ["english", "فارسی"]:
+            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c) or (len(cells) == 2 and cells[0].lower() in LANG_HEADERS and cells[1] in ("فارسی", "Persian")):
                 continue
             for c in cells:
                 items.extend(line_items(c))
@@ -1086,12 +1116,14 @@ def doc_blocks(items, mode, o):
             or (mode.startswith("Persian") and l == "fa")]
 
 
-def bilingual_groups(items, mode, o, voices, base, announce, skip_fences):
+def bilingual_groups(items, mode, o, voices, base, announce, skip_fences, chapter_word="Chapter"):
     groups = []
     for name, text in items:
         stem = "__".join(Path(name).with_suffix("").parts)
         sections = []
         for title, its in bilingual_sections(name, text, skip_fences):
+            if title:
+                title = re.sub(r"^Chapter\b", chapter_word, title)
             toks = tokens_for(its, mode, o)
             if not toks:
                 continue
@@ -1440,17 +1472,21 @@ def main():
 
     # ---------------- bilingual
     with tab_bi:
-        st.write("For files that mix **English and Persian** (like this course): each language is read by its own voice. "
-                 "The language is detected automatically, line by line.")
-        en_pool = [v for v in voices if v["locale"].startswith("en")]
+        learn = st.selectbox("Language you are learning (paired with Persian)", list(LEARN_LANGS), key="bi_learn")
+        pfx, chapter_word, default_voice, example = LEARN_LANGS[learn]
+        st.write(f"For files that mix **{learn} and Persian**: each language is read by its own voice. "
+                 "The language is detected automatically, line by line (accented letters are fine).")
+        en_pool = [v for v in voices if v["locale"].startswith(pfx)]
         fa_pool = [v for v in voices if v["locale"].startswith("fa")]
         if not fa_pool:
             st.warning("No Persian voice found in the voice list.")
         vc1, vc2 = st.columns(2)
         en_labels = [v["label"] for v in en_pool]
         fa_labels = [v["label"] for v in fa_pool]
-        en_def = next((i for i, v in enumerate(en_pool) if v["short"] == (voice if voice.startswith("en") else "en-US-AriaNeural")), 0)
-        en_v = en_pool[en_labels.index(vc1.selectbox("English voice", en_labels, index=en_def))]["short"] if en_pool else voice
+        if not en_pool:
+            st.warning(f"No {learn} voice found in the voice list.")
+        en_def = next((i for i, v in enumerate(en_pool) if v["short"] == (voice if voice.startswith(pfx) else default_voice)), 0)
+        en_v = en_pool[en_labels.index(vc1.selectbox(f"{learn} voice", en_labels, index=en_def, key=f"bi_voice_{pfx}"))]["short"] if en_pool else voice
         fa_def = next((i for i, v in enumerate(fa_pool) if v["short"] == "fa-IR-DilaraNeural"), 0)
         fa_v = fa_pool[fa_labels.index(vc2.selectbox("Persian voice", fa_labels, index=fa_def))]["short"] if fa_pool else voice
         voices_map = {"en": en_v, "fa": fa_v}
@@ -1459,19 +1495,19 @@ def main():
             "Study drill (English → Persian → English again)",
             "Both languages in original order",
             "English only",
-            "Persian only"])
+            "Persian only"], format_func=lambda m: m.replace("English", learn))
         o = dict(pause=0.0, repeats=1, read_fa=True, read_expl=False, max_fa=160)
         slow = -30
         if bmode.startswith("Study drill"):
             d1, d2, d3 = st.columns(3)
-            o["repeats"] = d1.number_input("English repeats", 1, 3, 2, help="1 = once. Extra repeats are slower.")
+            o["repeats"] = d1.number_input(f"{learn} repeats", 1, 3, 2, help="1 = once. Extra repeats are slower.")
             slow = d2.slider("Speed of repeats (%)", -60, 0, -30, 5)
             o["pause"] = d3.slider("Pause after each part (s)", 0.0, 6.0, 1.5, 0.5, help="Time to repeat aloud (shadowing).")
             e1, e2, e3 = st.columns(3)
             o["read_fa"] = e1.checkbox("Read the Persian translation", True)
             o["read_expl"] = e2.checkbox("Also read Persian explanations", False)
             o["max_fa"] = e3.number_input("Max length of a 'translation' (chars, 0 = any)", 0, 2000, 160,
-                                          help="A Persian line right after an English line counts as its translation if it is this short.")
+                                          help=f"A Persian line right after a {learn} line counts as its translation if it is this short.")
         else:
             o["pause"] = st.slider("Pause between lines (s)", 0.0, 6.0, 0.0, 0.5,
                                    help="0 = read continuously. Above 0 every line is a separate clip.")
@@ -1481,7 +1517,7 @@ def main():
         b_items = []
         if src == "Paste text":
             pasted = st.text_area("Bilingual text", height=220, key="bi_text",
-                                  placeholder="Where is the bread?\nنان کجاست؟\n…")
+                                  placeholder=f"{example}\nنان کجاست؟\n…")
             if pasted.strip():
                 b_items = [("pasted.txt", pasted)]
         else:
@@ -1497,11 +1533,11 @@ def main():
         all_items = [it for _, secs in parsed for _, its in secs for it in its]
         if all_items:
             n_en = sum(1 for l, _ in all_items if l == "en")
-            st.info(f"Detected {n_en} English and {len(all_items) - n_en} Persian line(s) in "
+            st.info(f"Detected {n_en} {learn} and {len(all_items) - n_en} Persian line(s) in "
                     f"{sum(len(s) for _, s in parsed)} section(s).")
             first = next((its for _, secs in parsed for _, its in secs if its), [])
             with st.expander("Check the language detection (first lines)"):
-                st.dataframe([{"voice": "English" if l == "en" else "Persian", "text": t} for l, t in first[:40]],
+                st.dataframe([{"voice": learn if l == "en" else "Persian", "text": t} for l, t in first[:40]],
                              hide_index=True)
             if st.button("🎧 Try the first few lines"):
                 sample = tokens_for(first[:14], bmode, o)
@@ -1520,7 +1556,7 @@ def main():
         bskip = g1.checkbox("Skip MP3 files already generated", True, key="bi_skip")
         bpar = g2.slider("Parallel requests", 1, 6, 3, key="bi_par")
         bfont = get_pdf_font(bfmts, font_bytes)
-        bgroups = bilingual_groups(b_items, bmode, o, voices_map, base, announce, skip_fences) if b_items else []
+        bgroups = bilingual_groups(b_items, bmode, o, voices_map, base, announce, skip_fences, chapter_word) if b_items else []
         btasks = plan_tasks(bgroups, bout, bfmts, cfg, bfont or None, bskip,
                             st.session_state.get("bi_book_title") or "Book") if bgroups and bfmts and bfont is not False else []
         if bgroups:
