@@ -165,10 +165,48 @@ def sections_from_md(text, only_fences=True):
         m = re.match(r"^#\s+.*?(\d+)\.\s+([A-Za-z].+)$", line)
         if m:
             title = f"Topic {m.group(1)}. {m.group(2)}"
-    if secs or only_fences:
+    if only_fences:
         return secs
-    plain = [re.sub(r"[#>*_`|]", " ", l).strip() for l in text.splitlines()]
-    return [(None, [l for l in plain if l])]
+    return sections_from_md_full(text)
+
+
+def _md_clean(s):
+    s = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", s)          # links / images -> their text
+    return re.sub(r"[*_`]{1,3}", "", s).strip()
+
+
+def sections_from_md_full(text):
+    """Whole .md file -> [(title, [lines])]. Every heading starts a new chapter; tables give one line per cell;
+    list / quote / emphasis marks are removed; fenced blocks are read like normal text."""
+    secs, title, lines, hdr = [], None, [], 0       # hdr = cells of a table row that may turn out to be a header
+    for raw in text.splitlines():
+        s = raw.strip()
+        if re.fullmatch(r"[\s:|\-_*=]{3,}", s):
+            if hdr and "|" in s:                    # |---|---| right after a row: that row was the table header
+                del lines[-hdr:]
+            hdr = 0
+            continue
+        if not s or s.startswith("```") or s.startswith("<!--"):
+            hdr = 0
+            continue
+        m = re.match(r"^#{1,6}\s+(.*)$", s)
+        if m:
+            if lines:
+                secs.append((title, lines))
+            title, lines = _md_clean(m.group(1)) or title, []
+            continue
+        if s.startswith("|"):
+            cells = [c for c in (_md_clean(c) for c in s.strip("|").split("|")) if c]
+            lines += cells
+            hdr = len(cells)
+            continue
+        hdr = 0
+        s = _md_clean(re.sub(r"^(>\s*)+|^[-*+]\s+|^\d+[.)]\s+", "", s))
+        if s:
+            lines.append(s)
+    if lines:
+        secs.append((title, lines))
+    return secs
 
 
 def read_sources(uploaded, folder):
@@ -1286,7 +1324,8 @@ def main():
         d1, d2, d3 = st.columns(3)
         announce = d1.checkbox("Read chapter titles aloud", True)
         skip = d2.checkbox("Skip MP3 files already generated", True)
-        only_fences = d3.checkbox("In .md files read only the ```text podcast blocks", True)
+        only_fences = d3.checkbox("In .md files read only the ```text podcast blocks", True,
+                                  help="Untick to read the WHOLE text of .md files: every heading becomes a chapter.")
         fmts = export_panel("batch", "Per chapter", "Per file", book=True)
         outdir = Path(st.text_input("Save files to folder", "tts_output"))
 
@@ -1299,6 +1338,13 @@ def main():
             chars = sum(len(t) for g in groups for s in g.sections for t in s.texts)
             st.info(f"{len(items)} source file(s) → {sum(len(g.sections) for g in groups)} chapter(s), about {chars:,} characters. "
                     f"Will create: {describe_tasks(tasks)}.")
+            empty = [n for n, _ in items if "__".join(Path(n).with_suffix("").parts) not in {x.name for x in groups}]
+            if empty and only_fences:
+                st.warning(f"{len(empty)} of {len(items)} files gave no text because they have no ```text podcast blocks "
+                           "(e.g. " + ", ".join(Path(n).name for n in empty[:3]) + "). "
+                           "Untick “In .md files read only the ```text podcast blocks” to read their full text.")
+            elif empty:
+                st.caption(f"{len(empty)} file(s) were empty and skipped.")
             if font:
                 warn_missing_glyphs(doc_text(groups), font)
 
