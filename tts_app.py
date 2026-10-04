@@ -178,7 +178,10 @@ def sections_from_txt(text):
     return secs
 
 
-def sections_from_md(text, only_fences=True):
+def sections_from_md(text, mode="auto"):
+    """mode: 'fences' = only the ```text podcast blocks; 'full' = the whole text (headings become chapters);
+    'auto' = podcast blocks if the file has a real one (150+ characters), otherwise the whole text."""
+    mode = {True: "fences", False: "full"}.get(mode, mode)
     secs, title, infence, buf = [], None, False, []
     for raw in text.splitlines():
         line = raw.rstrip()
@@ -197,7 +200,9 @@ def sections_from_md(text, only_fences=True):
         m = re.match(r"^#\s+.*?(\d+)\.\s+([A-Za-z].+)$", line)
         if m:
             title = f"Topic {m.group(1)}. {m.group(2)}"
-    if only_fences:
+    if mode == "fences":
+        return secs
+    if mode == "auto" and sum(len(x) for _, ls in secs for x in ls) >= 150:
         return secs
     return sections_from_md_full(text)
 
@@ -358,13 +363,13 @@ FORMAT_LABELS = {"mp3": "🔊 Audio (MP3)", "md": "📝 Markdown (.md)", "pdf": 
 GRAN = {"section": "Per section", "file": "Whole topic", "both": "Both"}
 
 
-def make_groups(items, repeat, announce, only_fences):
+def make_groups(items, repeat, announce, md_mode="auto"):
     """Batch tab: .txt / .md sources -> [Group]. One section per chapter."""
     groups = []
     for name, text in items:
         p = Path(name)
         stem = "__".join(p.with_suffix("").parts)
-        secs = sections_from_md(text, only_fences) if name.lower().endswith(".md") else sections_from_txt(text)
+        secs = sections_from_md(text, md_mode) if name.lower().endswith(".md") else sections_from_txt(text)
         secs = [(t, l) for t, l in secs if l]
         if not secs:
             continue
@@ -455,6 +460,28 @@ def resolve_pdf_font(custom=None):
     return None, None
 
 
+SYMBOL_FONTS = [                      # first one that exists is used for characters Vazirmatn lacks (← → ↓ ✓ ★ …)
+    FONT_DIR / "DejaVuSans.ttf",
+    Path(r"C:\Windows\Fonts\seguisym.ttf"), Path(r"C:\Windows\Fonts\segoeui.ttf"), Path(r"C:\Windows\Fonts\arial.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"), Path("/Library/Fonts/Arial Unicode.ttf"),
+    Path("/System/Library/Fonts/Apple Symbols.ttf"),
+]
+
+
+def resolve_symbol_font():
+    return next((p for p in SYMBOL_FONTS if p.exists()), None)
+
+
+def add_symbol_fallback(pdf):
+    """Let fpdf2 take characters the main font cannot draw from the symbol font (works with text shaping)."""
+    fb = resolve_symbol_font()
+    if fb:
+        pdf.add_font("FB", "", str(fb))
+        pdf.add_font("FB", "B", str(fb))
+        pdf.set_fallback_fonts(["FB"])
+
+
 @lru_cache(maxsize=8)
 def _cmap(path):
     from fontTools.ttLib import TTFont
@@ -463,7 +490,10 @@ def _cmap(path):
 
 def missing_glyphs(text, font_path):
     """Characters of `text` that the PDF font cannot draw (they would show as empty boxes)."""
-    cm = _cmap(str(font_path))
+    cm = set(_cmap(str(font_path)))
+    fb = resolve_symbol_font()
+    if fb:
+        cm |= _cmap(str(fb))
     return sorted({c for c in text if ord(c) > 32 and ord(c) not in cm and c not in "\u200c\u200d\u200e\u200f\ufeff"})
 
 
@@ -495,6 +525,7 @@ def render_pdf(title, sections, nested, font, book=None, report=None):
     pdf.set_auto_page_break(True, 20)
     pdf.add_font("TTS", "", str(reg))
     pdf.add_font("TTS", "B", str(bold))
+    add_symbol_fallback(pdf)
     pdf.set_title(title)
     pdf.set_creator("Unlimited Text to Speech")
     pdf.add_page()
@@ -656,6 +687,7 @@ def render_slides(items, font, size, dark, folder, on_page=None):
     pdf.set_margin(0)
     pdf.add_font("TTS", "", str(reg))
     pdf.add_font("TTS", "B", str(bold))
+    add_symbol_fallback(pdf)
 
     def set_f(text, style, pt):
         pdf.set_text_shaping(True, direction="rtl" if is_rtl(text) else "ltr")
@@ -1531,18 +1563,21 @@ def main():
         c2, c3 = st.columns(2)
         repeat = c2.number_input("Read each sentence N times", 1, 5, 1, help="Handy for shadowing practice (audio only).")
         parallel = c3.slider("Parallel requests", 1, 6, 3, help="Higher is faster but more likely to be throttled.")
-        d1, d2, d3 = st.columns(3)
+        d1, d2 = st.columns(2)
         announce = d1.checkbox("Read chapter titles aloud", True)
         skip = d2.checkbox("Skip MP3 files already generated", True)
-        only_fences = d3.checkbox("In .md files read only the ```text podcast blocks", True,
-                                  help="Untick to read the WHOLE text of .md files: every heading becomes a chapter.")
+        md_label = {"auto": "Auto — podcast blocks if the file has them, otherwise the whole text",
+                    "fences": "Only the ```text podcast blocks", "full": "The whole text (headings become chapters)"}
+        md_mode = st.selectbox("How to read .md files", list(md_label), format_func=md_label.get, key="batch_md_mode",
+                               help="Auto: a file with a real ```text podcast block (150+ characters) is read from its "
+                                    "blocks, every other file is read in full.")
         fmts = export_panel("batch", "Per chapter", "Per file", book=True, video=True)
         vo = video_setup("batch", fmts, vvoices, vbase, 3, REPEAT_HELP)
         outdir = Path(st.text_input("Save files to folder", "tts_output"))
 
         font = get_pdf_font(fmts, font_bytes)
         items = read_sources(uploaded, folder)
-        groups = make_groups(items, repeat, announce, only_fences) if items else []
+        groups = make_groups(items, repeat, announce, md_mode) if items else []
         tasks = plan_tasks(groups, outdir, fmts, cfg, font or None, skip,
                            st.session_state.get("batch_book_title") or "Book", vo or None) \
             if groups and fmts and font is not False and vo is not False else []
@@ -1551,12 +1586,18 @@ def main():
             st.info(f"{len(items)} source file(s) → {sum(len(g.sections) for g in groups)} chapter(s), about {chars:,} characters. "
                     f"Will create: {describe_tasks(tasks)}.{video_note(groups, vo)}")
             empty = [n for n, _ in items if "__".join(Path(n).with_suffix("").parts) not in {x.name for x in groups}]
-            if empty and only_fences:
+            if empty and md_mode == "fences":
                 st.warning(f"{len(empty)} of {len(items)} files gave no text because they have no ```text podcast blocks "
                            "(e.g. " + ", ".join(Path(n).name for n in empty[:3]) + "). "
-                           "Untick “In .md files read only the ```text podcast blocks” to read their full text.")
+                           "Choose “Auto” or “The whole text” in *How to read .md files* to read their full text.")
             elif empty:
                 st.caption(f"{len(empty)} file(s) were empty and skipped.")
+            if md_mode == "auto":
+                n_md = [t for n, t in items if n.lower().endswith(".md")]
+                n_blocks = sum(1 for t in n_md if sum(len(x) for _, ls in sections_from_md(t, "fences") for x in ls) >= 150)
+                if n_md:
+                    st.caption(f"{len(n_md)} .md file(s): {n_blocks} read from their podcast blocks, "
+                               f"{len(n_md) - n_blocks} read in full.")
             if font:
                 warn_missing_glyphs(doc_text(groups), font)
 
