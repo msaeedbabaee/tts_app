@@ -130,6 +130,8 @@ def split_text(text, limit=MAX_CHARS):
 
 
 async def synth(text, cfg, retries=5, on_chunk=None):
+    if not re.search(r"\w", text):                # only symbols (↓ → ★ …): nothing to say, and the service would error out
+        return b""
     out = bytearray()
     for chunk in split_text(text):
         for attempt in range(retries):
@@ -145,8 +147,8 @@ async def synth(text, cfg, retries=5, on_chunk=None):
                 if on_chunk:
                     on_chunk()
                 break
-            except Exception:
-                if attempt == retries - 1:
+            except Exception as e:  # noqa: BLE001
+                if attempt == retries - 1 or ("no audio" in str(e).lower() and attempt >= 1):   # retrying 'no audio' rarely helps
                     raise
                 await asyncio.sleep(1.5 * (attempt + 1))
     return bytes(out)
@@ -328,6 +330,7 @@ class Task:
     t1: float = 0.0
     size: int = 0
     err: str = ""
+    warn: str = ""
 
 
 def prog(ctx, stage=None, frac=None):
@@ -363,7 +366,7 @@ FORMAT_LABELS = {"mp3": "🔊 Audio (MP3)", "md": "📝 Markdown (.md)", "pdf": 
 GRAN = {"section": "Per section", "file": "Whole topic", "both": "Both"}
 
 
-def make_groups(items, repeat, announce, md_mode="auto"):
+def make_groups(items, repeat, announce, md_mode="auto", voices=None, base=None):
     """Batch tab: .txt / .md sources -> [Group]. One section per chapter."""
     groups = []
     for name, text in items:
@@ -373,18 +376,48 @@ def make_groups(items, repeat, announce, md_mode="auto"):
         secs = [(t, l) for t, l in secs if l]
         if not secs:
             continue
-        sections = [Section(name=f"{stem}/{i:03d}_{slug(t or 'section')}", title=t or f"Section {i}",
-                            blocks=[("p", ln) for ln in lines], texts=[build_text(t, lines, repeat, announce)],
-                            cards=text_cards(lines))
-                    for i, (t, lines) in enumerate(secs, 1)]
+        sections = []
+        for i, (t, lines) in enumerate(secs, 1):
+            render, n = mixed_audio(t, lines, repeat, announce, voices, base)
+            sections.append(Section(name=f"{stem}/{i:03d}_{slug(t or 'section')}", title=t or f"Section {i}",
+                                    blocks=[("p", ln) for ln in lines], texts=[build_text(t, lines, repeat, announce)],
+                                    cards=text_cards(lines), render=render, n_req=n))
         groups.append(Group(stem, p.stem, sections))
     return groups
 
 
 def text_cards(paragraphs):
-    """Plain text -> slides: long paragraphs are split at sentence ends into slide-sized chunks."""
-    return [Card([("p", ch)], [("say", "en", ch, False)])
-            for p in paragraphs for ch in split_text(p, 220) if ch.strip()]
+    """Plain text -> slides: long paragraphs are split at sentence ends into slide-sized chunks. Every line is spoken
+    run by run (Persian script -> 'fa' voice, Latin -> 'en' voice) and a chunk with nothing to say gets no slide."""
+    cards = []
+    for p in paragraphs:
+        for ch in split_text(p, 220):
+            toks = [("say", lang, t, False) for lang, t in line_items(ch.replace("\n", " "))]
+            if toks:
+                cards.append(Card([("p", ch)], toks))
+    return cards
+
+
+def mixed_audio(title, lines, repeat, announce, voices, base):
+    """When a section holds Persian script but the chosen voice is not Persian, speak it language by language
+    (otherwise the service answers 'No audio was received'). -> (render closure, requests) or (None, 0)."""
+    if not voices or voices.get("en") == voices.get("fa") or not any(FA_CH.search(x) for x in lines):
+        return None, 0
+    toks = []
+    if announce and title:
+        toks += [("say", "en", title + ".", False), ("pause", 0.6)]
+    for ln in lines:
+        runs = line_items(ln)
+        for _ in range(max(1, repeat)):
+            if runs:
+                toks += [("say", lang, t, False) for lang, t in runs] + [("pause", 0.3)]
+    n = sum(1 for k in toks if k[0] == "say")
+    if not n:
+        return None, 0
+
+    async def render(ctx):
+        return await render_tokens(toks, ctx, voices, base)
+    return render, n
 
 
 # ---- building the individual files
@@ -473,6 +506,12 @@ def resolve_symbol_font():
     return next((p for p in SYMBOL_FONTS if p.exists()), None)
 
 
+def needs_symbol_font(text, font_path):
+    """True only if some character of `text` is missing from the main font (so the symbol font is worth loading)."""
+    cm = _cmap(str(font_path))
+    return any(ord(c) > 32 and ord(c) not in cm and c not in "\u200c\u200d\u200e\u200f\ufeff" for c in set(text))
+
+
 def add_symbol_fallback(pdf):
     """Let fpdf2 take characters the main font cannot draw from the symbol font (works with text shaping)."""
     fb = resolve_symbol_font()
@@ -525,7 +564,12 @@ def render_pdf(title, sections, nested, font, book=None, report=None):
     pdf.set_auto_page_break(True, 20)
     pdf.add_font("TTS", "", str(reg))
     pdf.add_font("TTS", "B", str(bold))
-    add_symbol_fallback(pdf)
+    secs_all = [s for g_ in book for s in g_.sections] if book is not None else sections
+    all_text = title + "".join(s.title + "".join(x for b in s.blocks for x in b[1:]) for s in secs_all)
+    if book is not None:
+        all_text += "".join(g_.title for g_ in book)
+    if needs_symbol_font(all_text, reg):
+        add_symbol_fallback(pdf)
     pdf.set_title(title)
     pdf.set_creator("Unlimited Text to Speech")
     pdf.add_page()
@@ -687,7 +731,8 @@ def render_slides(items, font, size, dark, folder, on_page=None):
     pdf.set_margin(0)
     pdf.add_font("TTS", "", str(reg))
     pdf.add_font("TTS", "B", str(bold))
-    add_symbol_fallback(pdf)
+    if needs_symbol_font("".join(t + "".join(x for b in c.show for x in b[1:]) for t, c in items), reg):
+        add_symbol_fallback(pdf)
 
     def set_f(text, style, pt):
         pdf.set_text_shaping(True, direction="rtl" if is_rtl(text) else "ltr")
@@ -704,20 +749,23 @@ def render_slides(items, font, size, dark, folder, on_page=None):
                 texts += [(b[1], "B", fg), (b[2], "", acc)]
             else:
                 texts.append((b[1], "B" if not is_rtl(b[1]) else "", fg))
-        pt = 16
-        for cand in range(46, 15, -2):
-            tot = 0
+        def lay(pt):                                 # heights of every text at this size, and their total
+            hs = []
             for t, st_, _ in texts:
-                set_f(t, st_, cand)
-                tot += len(pdf.multi_cell(w, cand * .55, t, align="C", dry_run=True, output="LINES")) * cand * .55 + 7
-            if tot - 7 <= mh - top - bottom:
-                pt = cand
-                break
+                set_f(t, st_, pt)
+                hs.append(len(pdf.multi_cell(w, pt * .55, t, align="C", dry_run=True, output="LINES")) * pt * .55)
+            return hs, sum(hs) + 7 * (len(texts) - 1)
+
+        sizes, lo, hi, best = list(range(16, 47, 2)), 0, 15, 0       # biggest size that fits (binary search)
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if lay(sizes[mid])[1] <= mh - top - bottom:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        pt = sizes[best]
         lh = pt * .55
-        heights = []
-        for t, st_, _ in texts:
-            set_f(t, st_, pt)
-            heights.append(len(pdf.multi_cell(w, lh, t, align="C", dry_run=True, output="LINES")) * lh)
+        heights = lay(pt)[0]
         y = top + max(0, (mh - top - bottom - sum(heights) - 7 * (len(texts) - 1)) / 2)
         for (t, st_, col), hh in zip(texts, heights):
             set_f(t, st_, pt)
@@ -741,7 +789,7 @@ def render_slides(items, font, size, dark, folder, on_page=None):
     paths = []
     for i in range(len(doc)):
         p = Path(folder) / f"s{i:05d}.png"
-        doc[i].render(scale=scale).to_pil().convert("RGB").save(p)
+        doc[i].render(scale=scale).to_pil().convert("RGB").save(p, compress_level=1)
         paths.append(p)
         if on_page:
             on_page(i + 1, len(doc))
@@ -789,12 +837,24 @@ async def build_video(ctx, secs, title, voices, base, vo, font):
         lines.append(f"file '{slides[-1].name}'")
         Path(td, "list.txt").write_text("\n".join(lines), encoding="utf-8")
         prog(ctx, "encoding video 0%", 0.70)
-        await asyncio.to_thread(run_ffmpeg, [
-            "-f", "concat", "-safe", "0", "-i", "list.txt", "-i", "audio.mp3",
-            "-vf", f"fps={VIDEO_FPS},format=yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage",
-            "-crf", str(VIDEO_CRF), "-g", str(VIDEO_FPS * 10), "-c:a", "aac", "-b:a", "48k", "-ac", "1",
-            "-shortest", "-movflags", "+faststart", "out.mp4"], td, sum(durs),
-            lambda f: prog(ctx, f"encoding video {int(f * 100)}%", 0.70 + 0.28 * f))
+        head = ["-f", "concat", "-safe", "0", "-i", "list.txt", "-i", "audio.mp3"]
+        tail = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "stillimage", "-crf", str(VIDEO_CRF),
+                "-c:a", "aac", "-b:a", "48k", "-ac", "1", "-shortest", "-movflags", "+faststart", "out.mp4"]
+        # one frame per slide (variable frame rate): fastest, smallest, and slide changes are exact to the millisecond;
+        # older ffmpeg versions spell the option differently, the last variant is a plain 5 fps fallback
+        variants = [["-vf", "format=yuv420p", "-fps_mode", "vfr"], ["-vf", "format=yuv420p", "-vsync", "vfr"],
+                    ["-vf", f"fps={VIDEO_FPS},format=yuv420p"]]
+        err = None
+        for v in variants:
+            try:
+                await asyncio.to_thread(run_ffmpeg, head + v + tail, td, sum(durs),
+                                        lambda f: prog(ctx, f"encoding video {int(f * 100)}%", 0.70 + 0.28 * f))
+                err = None
+                break
+            except RuntimeError as e:
+                err = e
+        if err:
+            raise err
         return Path(td, "out.mp4").read_bytes()
 
 
@@ -911,7 +971,8 @@ def snapshot(tasks, t_start):
 async def run_tasks(tasks, parallel, skip_existing, on_snapshot=None):
     """Build all files. on_snapshot(snapshot) is called about 3 times a second with live progress."""
     sem = asyncio.Semaphore(parallel)           # how many MP3s are built at once
-    piece_sem = asyncio.Semaphore(parallel)     # how many requests to the speech service are in flight
+    # a video needs one request per sentence (an MP3 needs one per ~2500 characters), so allow more at once
+    piece_sem = asyncio.Semaphore(max(parallel, 6) if any(t.kind == "mp4" for t in tasks) else parallel)
     doc_sem = asyncio.Semaphore(2)              # md / pdf building: separate pool, runs alongside the audio
     vid_sem = asyncio.Semaphore(2)              # videos (slides + encoding)
     results = {"done": 0, "skipped": 0, "failed": []}
@@ -927,6 +988,9 @@ async def run_tasks(tasks, parallel, skip_existing, on_snapshot=None):
             ctx = {"sem": piece_sem, "cache": {}, "task": t}
             try:
                 data = await t.run(ctx)
+                if not data:
+                    raise RuntimeError("no audio could be produced: the voice cannot read this text "
+                                       "(pick a voice of the text's language)")
                 prog(ctx, "saving", 0.99)
                 t.path.parent.mkdir(parents=True, exist_ok=True)
                 t.path.write_bytes(data)
@@ -1056,7 +1120,7 @@ def clean_pdf_pages(pages, rm_headers=True, rm_pagenums=True, skip_foreign=False
 PM_WHOLE, PM_PAGE, PM_EVERY = "Whole range as one part", "One part per page", "One part every N pages"
 
 
-def pdf_groups(pages, stem, title, mode, every):
+def pdf_groups(pages, stem, title, mode, every, voices=None, base=None):
     """Cleaned PDF pages -> [Group]. Parts (= sections) are single pages, N pages, or the whole range."""
     pages = [(n, t) for n, t in pages if t.strip()]
     if not pages:
@@ -1075,8 +1139,10 @@ def pdf_groups(pages, stem, title, mode, every):
             if len(grp) > 1:
                 blocks.append(("h", f"Page {n}"))
             blocks += [("p", p) for p in re.split(r"\n\s*\n", t) if p.strip()]
+        paras = [x[1] for x in blocks if x[0] == "p"]
+        render, n = mixed_audio(None, [ln for p in paras for ln in p.split("\n")], 1, False, voices, base)
         sections.append(Section(f"{stem}_{key}", ttl, blocks, ["\n\n".join(t for _, t in grp)],
-                                cards=text_cards([x[1] for x in blocks if x[0] == "p"])))
+                                cards=text_cards(paras), render=render, n_req=n))
     key, _ = label(pages[0][0], pages[-1][0])
     return [Group(f"{stem}_{key}", title, sections)]
 
@@ -1250,7 +1316,15 @@ async def piece(ctx, text, voice, rate, pitch, volume):
     key = (text, voice, rate, pitch, volume)
     if key not in ctx["cache"]:
         async with ctx["sem"]:
-            ctx["cache"][key] = await synth(text, dict(voice=voice, rate=rate, pitch=pitch, volume=volume))
+            try:
+                ctx["cache"][key] = await synth(text, dict(voice=voice, rate=rate, pitch=pitch, volume=volume))
+            except Exception as e:  # noqa: BLE001
+                if "no audio" not in str(e).lower():
+                    raise
+                ctx["cache"][key] = b""            # this voice cannot read this line: skip it, keep the rest of the file
+                ctx["skipped"] = ctx.get("skipped", 0) + 1
+                if ctx.get("task") is not None:
+                    ctx["task"].warn = f"{ctx['skipped']} line(s) the voice could not read were skipped"
     tick(ctx)
     return ctx["cache"][key]
 
@@ -1461,7 +1535,8 @@ def progress_panel():
             elif t.state == "skipped":
                 lines.append(f"⏭ `{t.path.name}` — already exists")
             else:
-                lines.append(f"✅ `{t.path.name}` — {t.size / 1024:,.0f} KB · {t.t1 - t.t0:.1f}s")
+                lines.append(f"✅ `{t.path.name}` — {t.size / 1024:,.0f} KB · {t.t1 - t.t0:.1f}s"
+                             + (f" · ⚠ {t.warn}" if t.warn else ""))
         recent.markdown("\n\n".join(lines))
     return update
 
@@ -1505,7 +1580,17 @@ def main():
         pitch = st.slider("Pitch (Hz)", -50, 50, 0, 5)
         volume = st.slider("Volume (%)", -50, 50, 0, 5)
         cfg = dict(voice=voice, rate=f"{round((speed - 1) * 100):+d}%", pitch=f"{pitch:+d}Hz", volume=f"{volume:+d}%")
-        vvoices = {"en": voice, "fa": voice}
+        fa_side = [v for v in voices if v["locale"].startswith("fa")]
+        if fa_side and not voice.startswith("fa"):
+            fa_lab = [v["label"] for v in fa_side]
+            fa_pick = st.selectbox("Persian voice (for Persian lines)", fa_lab, key="side_fa_voice",
+                                   index=next((i for i, v in enumerate(fa_side) if v["short"] == "fa-IR-DilaraNeural"), 0),
+                                   help="Batch / PDF / Single tabs: lines in Persian script use this voice, "
+                                        "other lines use the voice above.")
+            fa_voice = fa_side[fa_lab.index(fa_pick)]["short"]
+        else:
+            fa_voice = voice
+        vvoices = {"en": voice, "fa": fa_voice}
         vbase = dict(speed=speed, slow=-30, pitch=cfg["pitch"], volume=cfg["volume"])
 
         st.divider()
@@ -1537,8 +1622,9 @@ def main():
         if st.button("Generate", type="primary", disabled=not text.strip() or not fm1 or font1 is False or vo1 is False):
             base_name = slug(title1, 40) if title1.strip() else "speech"
             paras = [p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+            render1, n1 = mixed_audio(None, [ln for p in paras for ln in p.split("\n")], 1, False, vvoices, vbase)
             sec = Section(base_name, title1.strip() or "Speech", [("p", p) for p in paras], [text],
-                          cards=text_cards(paras), n_req=len(split_text(text)))
+                          cards=text_cards(paras), render=render1, n_req=n1 or len(split_text(text)))
             with tempfile.TemporaryDirectory() as td:
                 tasks1 = plan_tasks([Group(base_name, sec.title, [sec])], Path(td), {k: {"section"} for k in fm1},
                                     cfg, font1 or None, False, "Book", vo1 or None)
@@ -1577,7 +1663,7 @@ def main():
 
         font = get_pdf_font(fmts, font_bytes)
         items = read_sources(uploaded, folder)
-        groups = make_groups(items, repeat, announce, md_mode) if items else []
+        groups = make_groups(items, repeat, announce, md_mode, vvoices, vbase) if items else []
         tasks = plan_tasks(groups, outdir, fmts, cfg, font or None, skip,
                            st.session_state.get("batch_book_title") or "Book", vo or None) \
             if groups and fmts and font is not False and vo is not False else []
@@ -1662,7 +1748,7 @@ def main():
                         pfont = get_pdf_font(pfmts, font_bytes)
                         if pfont:
                             warn_missing_glyphs(full, pfont)
-                        groups = pdf_groups(cleaned, slug(Path(pdf.name).stem, 40), Path(pdf.name).stem, pmode, every)
+                        groups = pdf_groups(cleaned, slug(Path(pdf.name).stem, 40), Path(pdf.name).stem, pmode, every, vvoices, vbase)
                         tasks = plan_tasks(groups, pout, pfmts, cfg, pfont or None, False, "Book", pvo or None) \
                             if pfmts and pfont is not False and pvo is not False else []
                         if tasks:
