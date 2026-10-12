@@ -1262,7 +1262,8 @@ def tokens_for(items, mode, o):
             if c["en"]:
                 toks += [("say", "en", c["en"], False), ("pause", o["pause"])]
                 if o["read_fa"] and c["fa"]:
-                    toks += [("say", "fa", " ".join(c["fa"]), False), ("pause", o["pause"])]
+                    for _ in range(o.get("fa_repeats", 1)):
+                        toks += [("say", "fa", " ".join(c["fa"]), False), ("pause", o["pause"])]
                 for _ in range(o["repeats"] - 1):
                     toks += [("say", "en", c["en"], True), ("pause", o["pause"])]
             elif o["read_expl"]:
@@ -1270,6 +1271,7 @@ def tokens_for(items, mode, o):
         return toks
     keep = [(l, t) for l, t in items if mode.startswith("Both") or (mode.startswith("English") and l == "en")
             or (mode.startswith("Persian") and l == "fa")]
+    keep = [it for it in keep for _ in range(max(1, o.get("line_repeats", 1)))]      # each line N times in a row
     for lang, text in keep:
         if o["pause"] <= 0 and toks and toks[-1][0] == "say" and toks[-1][1] == lang:
             toks[-1] = ("say", lang, toks[-1][2] + "\n\n" + text, False)
@@ -1788,19 +1790,22 @@ def main():
             "Both languages in original order",
             "English only",
             "Persian only"], format_func=lambda m: m.replace("English", learn))
-        o = dict(pause=0.0, repeats=1, read_fa=True, read_expl=False, max_fa=160)
+        o = dict(pause=0.0, repeats=1, fa_repeats=1, line_repeats=1, read_fa=True, read_expl=False, max_fa=160)
         slow = -30
         if bmode.startswith("Study drill"):
             d1, d2, d3 = st.columns(3)
-            o["repeats"] = d1.number_input(f"{learn} repeats", 1, 3, 2, help="1 = once. Extra repeats are slower.")
+            o["repeats"] = d1.number_input(f"{learn} repeats", 1, 10, 2, help="Total times the foreign line is spoken (1 = once). Extra repeats are slower.")
             slow = d2.slider("Speed of repeats (%)", -60, 0, -30, 5)
             o["pause"] = d3.slider("Pause after each part (s)", 0.0, 6.0, 1.5, 0.5, help="Time to repeat aloud (shadowing).")
             e1, e2, e3 = st.columns(3)
             o["read_fa"] = e1.checkbox("Read the Persian translation", True)
+            o["fa_repeats"] = e1.number_input("Persian translation repeats", 1, 10, 1, help="How many times the Persian translation is spoken.")
             o["read_expl"] = e2.checkbox("Also read Persian explanations", False)
             o["max_fa"] = e3.number_input("Max length of a 'translation' (chars, 0 = any)", 0, 2000, 160,
                                           help=f"A Persian line right after a {learn} line counts as its translation if it is this short.")
         else:
+            o["line_repeats"] = st.number_input("Repeat each line N times", 1, 10, 1, key="bi_line_rep",
+                                                help="Every line is spoken N times in a row before the next line (1 = once).")
             o["pause"] = st.slider("Pause between lines (s)", 0.0, 6.0, 0.0, 0.5,
                                    help="0 = read continuously. Above 0 every line is a separate clip.")
         base = dict(speed=speed, slow=slow, pitch=cfg["pitch"], volume=cfg["volume"])
