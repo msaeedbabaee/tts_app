@@ -42,6 +42,19 @@ from pathlib import Path
 
 import edge_tts
 import streamlit as st
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+MIN_EDGE_TTS = (7, 2, 8)          # older versions get 403 from Microsoft's service (time-based Sec-MS-GEC token)
+
+
+def edge_tts_version():
+    """-> (version string or None, tuple of ints, True if it is at least MIN_EDGE_TTS)."""
+    try:
+        v = _pkg_version("edge-tts")
+    except PackageNotFoundError:
+        return None, (), False
+    nums = tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+    return v, nums, nums >= MIN_EDGE_TTS
 
 MAX_CHARS = 2500  # size of one request to the service; longer text is split automatically
 
@@ -1602,12 +1615,25 @@ def main():
                 st.audio(asyncio.run(synth(sample, cfg)), format="audio/mp3")
             except Exception as e:  # noqa: BLE001
                 st.error(f"Preview failed: {e}")
+                if "403" in str(e):
+                    st.info("403 = Microsoft's service refused the request. Check the edge-tts version below, reboot the app, "
+                            "lower 'Parallel requests', or run the app on your own computer (shared cloud IPs are sometimes blocked).")
 
         with st.expander("📄 PDF font"):
             font_up = st.file_uploader("Custom font (.ttf) — optional", type=["ttf"], key="pdf_font_up")
             st.caption("Default: Vazirmatn (Persian + English) from the `fonts/` folder. "
                        "Upload another .ttf if your text uses other scripts (Chinese, Cyrillic, …).")
         font_bytes = font_up.getvalue() if font_up else None
+
+        st.divider()
+        ev, _, ev_ok = edge_tts_version()
+        if ev is None:
+            st.caption("edge-tts: version unknown")
+        elif ev_ok:
+            st.caption(f"edge-tts {ev} ✅")
+        else:
+            st.warning(f"edge-tts {ev} is outdated (need {'.'.join(map(str, MIN_EDGE_TTS))} or newer): "
+                       "Microsoft rejects it with 403. Put `edge-tts>=7.2.8` in requirements.txt and reboot the app.")
 
     tab1, tab2, tab_pdf, tab_bi, tab3 = st.tabs(["✍️ Single text", "📚 Batch files", "📄 PDF", "🌐 Bilingual", "🎙 Voice gallery"])
 
